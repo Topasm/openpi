@@ -2,16 +2,19 @@ import dataclasses
 import enum
 import logging
 import socket
-
+import pathlib
 import tyro
 
 from omnigibson.learning.utils.network_utils import WebsocketPolicyServer
-from omnigibson.learning.datas import BehaviorLerobotDatasetMetadata
 
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.shared.eval_b1k_wrapper import B1KPolicyWrapper
 from openpi.training import config as _config
+
+import os
+DATASETS_BASE_DIR = pathlib.Path(
+    os.getenv("DATASETS_ROOT", default=".")).resolve()
 
 
 class EnvMode(enum.Enum):
@@ -49,10 +52,9 @@ class Args:
     # prompt.
     default_prompt: str | None = None
 
-    # Dataset root, used to retrieve the prompt of the task if taskname is not None.
-    dataset_root: str | None = "/scr/behavior/2025-challenge-demos"
+    dataset_root: str | None = DATASETS_BASE_DIR / "2025-challenge-demos"
     # If provided, will be used to retrieve the prompt of the task, otherwise use turning_on_radio as default.
-    task_name: str | None = None
+    task_name: str | None = "turning_on_radio"
 
     # Port to serve the policy on.
     port: int = 8000
@@ -63,25 +65,48 @@ class Args:
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
 
+# Default checkpoints that should be used for each environment.
+DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
+    EnvMode.ALOHA: Checkpoint(
+        config="pi0_aloha",
+        dir="gs://openpi-assets/checkpoints/pi0_base",
+    ),
+    EnvMode.ALOHA_SIM: Checkpoint(
+        config="pi0_aloha_sim",
+        dir="gs://openpi-assets/checkpoints/pi0_aloha_sim",
+    ),
+    EnvMode.DROID: Checkpoint(
+        config="pi0_fast_droid",
+        dir="gs://openpi-assets/checkpoints/pi0_fast_droid",
+    ),
+    EnvMode.LIBERO: Checkpoint(
+        config="pi0_fast_libero",
+        dir="gs://openpi-assets/checkpoints/pi0_fast_libero",
+    ),
+}
+
+
+def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+    """Create a default policy for the given environment."""
+    if checkpoint := DEFAULT_CHECKPOINT.get(env):
+        return _policy_config.create_trained_policy(
+            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+        )
+    raise ValueError(f"Unsupported environment mode: {env}")
+
+
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
-    return _policy_config.create_trained_policy(
-        _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
-    )
+    match args.policy:
+        case Checkpoint():
+            return _policy_config.create_trained_policy(
+                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+            )
+        case Default():
+            return create_default_policy(args.env, default_prompt=args.default_prompt)
 
 
 def main(args: Args) -> None:
-    metadata = BehaviorLerobotDatasetMetadata(
-        repo_id="behavior-1k/2025-challenge-demos",
-        root=args.dataset_root,
-        tasks=[args.task_name] if args.task_name else "turning_on_radio",
-        modalities=[],
-        cameras=[],
-    )
-    prompt = list(metadata.tasks.values())[0]
-    # log the prompt used
-    logging.info(f"Using prompt: {prompt}")
-
     policy = create_policy(args)
     policy_metadata = policy.metadata
 
@@ -89,7 +114,7 @@ def main(args: Args) -> None:
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
 
-    policy = B1KPolicyWrapper(policy, text_prompt=prompt)
+    policy = B1KPolicyWrapper(policy)
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
