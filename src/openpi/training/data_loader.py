@@ -130,7 +130,7 @@ class FakeDataset(Dataset):
 def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int) -> Dataset:
     """Create a dataset for training."""
     from omnigibson.learning.datas.lerobot_dataset import BehaviorLeRobotDataset
-    
+
     dataset = BehaviorLeRobotDataset(
         repo_id=data_config.repo_id,
         root=data_config.behavior_dataset_root,
@@ -587,4 +587,5 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            # Yield observation, actions, and full batch dict (for movement_label, etc.)
+            yield _model.Observation.from_dict(batch), batch["actions"], batch

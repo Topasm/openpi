@@ -458,3 +458,146 @@ def _assert_quantile_stats(norm_stats: at.PyTree[NormStats]) -> None:
             raise ValueError(
                 f"quantile stats must be provided if use_quantile_norm is True. Key {k} is missing q01 or q99."
             )
+
+
+# ============================================================================
+# Online Movement Labeler for MoE Training
+# ============================================================================
+
+import logging
+from typing import Any
+
+logger = logging.getLogger("openpi")
+
+
+class OnlineMovementLabeler(DataTransformFn):
+    """Transform that adds movement labels to samples during training.
+
+    This transform computes movement type from velocity information in the state
+    and adds a 'movement_label' field for MoE expert routing.
+
+    For standard track (no global position info), this uses:
+    - base_qvel [0:3]: Base joint velocities (3D) from compact state
+
+    Movement classification:
+    - Navigation (label 1): Base moving (velocity magnitude > threshold)
+    - Manipulation (label 0): Base not moving (arms-only or static)
+
+    Args:
+        velocity_threshold: Threshold for detecting base movement (L2 norm of velocity)
+        state_key: Key in the sample dict that contains state observations
+        use_moe_labels: If True, use 2-category MoE labels (0=manipulation, 1=navigation)
+    """
+
+    def __init__(
+        self,
+        velocity_threshold: float = 0.01,
+        state_key: str = "state",
+        use_moe_labels: bool = True,
+    ):
+        self.velocity_threshold = velocity_threshold
+        self.state_key = state_key
+        self.use_moe_labels = use_moe_labels
+
+        # State indices after B1kInputs transform (23-dim compact state)
+        # B1kInputs creates: [base_qvel(3), trunk_qpos(4), arm_left(7), arm_right(7), grippers(2)]
+        self.base_qvel_indices = np.s_[0:3]  # 3D base joint velocities (already in compact state!)
+
+        # Mutable state for statistics tracking
+        self._label_counts = {0: 0, 1: 0}
+        self._sample_count = 0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        """Add movement label to the sample.
+
+        Args:
+            data: Dataset sample containing state observations.
+
+        Returns:
+            Sample with added 'movement_label' field.
+        """
+        # Extract state from sample
+        if self.state_key not in data:
+            logger.warning(f"Sample missing '{self.state_key}' key, skipping movement labeling")
+            data['movement_label'] = 0  # Default to manipulation
+            return data
+
+        state = np.asarray(data[self.state_key])
+
+        # Extract base velocity from compact state
+        # State shape: (state_dim,) for single timestep or (horizon, state_dim) for sequence
+        if state.ndim == 1:
+            # Single timestep
+            base_qvel = state[self.base_qvel_indices]
+        elif state.ndim == 2:
+            # Sequence - take mean absolute velocity over the horizon
+            base_qvel = np.mean(np.abs(state[:, self.base_qvel_indices]), axis=0)
+        else:
+            logger.warning(f"Unexpected state shape {state.shape}, defaulting to manipulation")
+            data['movement_label'] = 0
+            return data
+
+        # Compute base velocity magnitude (L2 norm)
+        base_vel_magnitude = np.linalg.norm(base_qvel)
+
+        # Debug: Log velocity magnitudes for first few samples
+        if self._sample_count < 10:
+            logger.info(
+                f"Sample {self._sample_count}: base_vel={base_vel_magnitude:.6f}, "
+                f"threshold={self.velocity_threshold}"
+            )
+
+        # Classify movement type based on base velocity only
+        # If base is moving significantly -> Navigation (label 1)
+        # Otherwise -> Manipulation (label 0)
+        if base_vel_magnitude > self.velocity_threshold:
+            movement_label = 1  # Navigation
+        else:
+            movement_label = 0  # Manipulation
+
+        # Add to sample
+        data['movement_label'] = int(movement_label)
+
+        # Update statistics (for debugging)
+        self._sample_count += 1
+        self._label_counts[movement_label] = self._label_counts.get(movement_label, 0) + 1
+
+        # Log statistics every 1000 samples
+        if self._sample_count % 1000 == 0:
+            self._log_statistics()
+
+        return data
+
+    def _log_statistics(self):
+        """Log movement label statistics."""
+        if self._sample_count == 0:
+            return
+
+        # Always 2-category labels (manipulation vs navigation)
+        total = self._label_counts.get(0, 0) + self._label_counts.get(1, 0)
+        if total > 0:
+            logger.info(
+                f"Online movement labels (after {self._sample_count} samples): "
+                f"Manipulation={self._label_counts.get(0, 0)} ({self._label_counts.get(0, 0)/total:.1%}), "
+                f"Navigation={self._label_counts.get(1, 0)} ({self._label_counts.get(1, 0)/total:.1%})"
+            )
+
+    def get_statistics(self) -> dict:
+        """Get current label statistics.
+
+        Returns:
+            Dictionary with label counts and proportions.
+        """
+        total = sum(self._label_counts.values())
+        if total == 0:
+            return {
+                'total_samples': 0,
+                'label_counts': {},
+                'label_proportions': {},
+            }
+
+        return {
+            'total_samples': total,
+            'label_counts': dict(self._label_counts),
+            'label_proportions': {k: v / total for k, v in self._label_counts.items()},
+        }

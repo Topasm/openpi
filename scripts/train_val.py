@@ -16,6 +16,7 @@ import tqdm_loggable.auto as tqdm
 import wandb
 
 import openpi.models.model as _model
+import openpi.models.pi0_moe as pi0_moe
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
@@ -107,7 +108,8 @@ def _create_validation_data_loader(
 
         def __iter__(self):
             for batch in self._torch_data_loader:
-                yield _model.Observation.from_dict(batch), batch["actions"]
+                # Yield observation, actions, and full batch dict (for movement_label, etc.)
+                yield _model.Observation.from_dict(batch), batch["actions"], batch
 
     val_dataset = _data_loader.create_behavior_dataset(actual_val_data_config, val_config.model.action_horizon)
     logging.info(f"Validation dataset created for {actual_val_data_config.repo_id}")
@@ -151,7 +153,11 @@ def _compute_validation_losses(
         model = nnx.merge(state.model_def, state.params)
         model.eval()
 
-        observation, actions = batch
+        # Handle 3-tuple format (observation, actions, batch_dict)
+        if len(batch) == 3:
+            observation, actions, _ = batch
+        else:
+            observation, actions = batch
         val_rng = jax.random.fold_in(rng, state.step)
 
         return val_loss_fn(model, val_rng, observation, actions)
@@ -339,10 +345,17 @@ def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    batch: tuple[_model.Observation, _model.Actions] | tuple[_model.Observation, _model.Actions, dict],
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
+
+    # Extract observation and actions from batch
+    # Note: Movement labels are extracted but not yet used (for future MoE implementation)
+    if len(batch) == 3:
+        observation, actions, _batch_dict = batch
+    else:
+        observation, actions = batch
 
     @at.typecheck
     def loss_fn(
@@ -352,7 +365,6 @@ def train_step(
         return jnp.mean(chunked_loss)
 
     train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
@@ -389,6 +401,7 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+
     return new_state, info
 
 

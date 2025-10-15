@@ -17,6 +17,8 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi0_moe as pi0_moe
+import openpi.models.moe as moe
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
@@ -430,6 +432,72 @@ class LeRobotB1KDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotB1KDataConfigMoE(DataConfigFactory):
+    """B1K data config with online movement labeling for MoE training.
+
+    This config adds OnlineMovementLabeler to compute movement labels on-the-fly
+    during training using velocity information from proprioception (standard track compatible).
+
+    Uses base_qvel [0:3] from the compact state (after B1kInputs) to classify:
+    - Navigation (label 1): Base moving (velocity > threshold)
+    - Manipulation (label 0): Base not moving (arms-only or static)
+    """
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    # Movement labeling configuration (velocity-based, uses only base_qvel)
+    enable_movement_labels: bool = True
+    velocity_threshold: float = 0.01  # L2 norm threshold for base velocity
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Same repack transform as base config
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/egocentric_camera": "observation.images.rgb.head",
+                        "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+                        "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Start with standard B1K data transforms
+        data_transforms = _transforms.Group(
+            inputs=[b1k_policy.B1kInputs(
+                action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[b1k_policy.B1kOutputs(action_dim=23)],
+        )
+
+        # Add online movement labeler if enabled
+        if self.enable_movement_labels:
+            movement_labeler = _transforms.OnlineMovementLabeler(
+                velocity_threshold=self.velocity_threshold,
+                state_key="state",  # After B1kInputs transform
+                use_moe_labels=True,  # Always use 2-category labels
+            )
+            # Add to data transforms (not model transforms - we want it before normalization)
+            data_transforms = data_transforms.push(inputs=[movement_labeler])
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            use_quantile_norm=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -782,6 +850,53 @@ _CONFIGS = [
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir="./outputs/checkpoints",
         num_workers=min(32, os.cpu_count() - 2),
+    ),
+
+    # B1K MoE config - Uses velocity-based online movement labeling with MoE layers
+    # NOTE: This config uses MoE architecture with 2 experts (manipulation + navigation)
+    # Movement labels computed from base_qvel (standard track compatible)
+    TrainConfig(
+        name="pi0_b1k_moe",
+        exp_name="openpi",
+        project_name="B1K_MoE",
+        model=pi0_moe.Pi0MoEConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            moe_config=moe.MoEConfig(
+                num_experts=2,
+                router_type="supervised",
+                load_balancing_loss_coef=0.01,
+                router_z_loss_coef=0.001,
+            ),
+            moe_layers="all",
+        ),
+        data=LeRobotB1KDataConfigMoE(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(190)),
+                behavior_dataset_root=DATASETS_BASE_DIR / "2025-challenge-demos",
+            ),
+            # Velocity-based movement labeling (standard track compatible, uses only base_qvel)
+            enable_movement_labels=True,
+            velocity_threshold=0.01,  # L2 norm threshold for base velocity
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=50_000,
+        freeze_filter=pi0_moe.Pi0MoEConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            moe_config=moe.MoEConfig(num_experts=2, router_type="supervised"),
+            moe_layers="all",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        val_log_interval=2500,
+        val_repo_id="behavior-1k/2025-challenge-demos",
+        val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=0,  # Disable multiprocessing due to BehaviorLeRobotDataset pickle issues
     ),
 
     #
