@@ -194,42 +194,7 @@ class MoEModule(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
     adarms: bool = False
 
-    def setup(self):
-        # All experts must have the same depth
-        assert all(config.depth == self.configs[0].depth for config in self.configs)
-
-        self.embedder = gemma.Embedder(
-            vocab_size=gemma.PALIGEMMA_VOCAB_SIZE,
-            embed_dim=self.configs[0].width,
-            name="embedder",
-        )
-
-        # Create MoE blocks with layer indices
-        self.layers = []
-        for layer_idx in range(self.configs[0].depth):
-            block = nn.remat(
-                MoEBlock,
-                prevent_cse=False,
-                static_argnums=(7,),  # deterministic
-                policy=jax.checkpoint_policies.nothing_saveable,
-            )(
-                configs=self.configs,
-                layer_idx=layer_idx,
-                dropout=self.dropout,
-                dropout_bdims=self.dropout_bdims,
-                name=f"layer_{layer_idx}",
-            )
-            self.layers.append(block)
-
-        self.final_norms = [
-            gemma.RMSNorm(name=gemma._name("final_norm", i)) for i in range(len(self.configs))
-        ]
-
-    @at.typecheck
-    def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
-        return self.embedder.encode(tokens).astype(self.embed_dtype)
-
-    @at.typecheck
+    @nn.compact
     def __call__(
         self,
         embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
@@ -264,36 +229,73 @@ class MoEModule(nn.Module):
 
         # Run through layers
         all_moe_aux = []
-        for layer in self.layers:
-            embedded, kv_cache, moe_aux = layer(
+
+        # Handle KV cache properly - it should be a tuple of (keys, values) for each layer
+        # or None if no caching
+        if kv_cache is not None:
+            # Split KV cache for each layer
+            kv_caches = [(kv_cache[0][layer_idx], kv_cache[1][layer_idx]) for layer_idx in range(self.configs[0].depth)]
+            new_kv_caches_k = []
+            new_kv_caches_v = []
+        else:
+            kv_caches = [None] * self.configs[0].depth
+            new_kv_caches_k = None
+            new_kv_caches_v = None
+
+        for layer_idx in range(self.configs[0].depth):
+            block = nn.remat(
+                MoEBlock,
+                prevent_cse=False,
+                static_argnums=(7,),  # deterministic
+                policy=jax.checkpoint_policies.nothing_saveable,
+            )(
+                configs=self.configs,
+                layer_idx=layer_idx,
+                dropout=self.dropout,
+                dropout_bdims=self.dropout_bdims,
+                name=f"layer_{layer_idx}",
+            )
+            embedded, layer_kv_cache, moe_aux = block(
                 embedded,
-                kv_cache,
+                kv_caches[layer_idx],  # Per-layer cache
                 positions,
                 mask,
                 adarms_cond,
                 movement_labels,
                 deterministic,
             )
+
+            # Collect new KV cache for this layer
+            if kv_cache is not None and layer_kv_cache is not None:
+                new_kv_caches_k.append(layer_kv_cache[0])
+                new_kv_caches_v.append(layer_kv_cache[1])
+
             if moe_aux is not None:
                 all_moe_aux.append(moe_aux)
+
+        # Reconstruct full KV cache
+        if kv_cache is not None:
+            kv_cache = (jnp.stack(new_kv_caches_k), jnp.stack(new_kv_caches_v))
+        else:
+            kv_cache = None
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
         # Final norm
         outputs = [
-            f(e, a)[0] if e is not None else e
-            for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
+            gemma.RMSNorm(name=gemma._name("final_norm", i))(e, a)[0] if e is not None else e
+            for i, (e, a) in enumerate(zip(embedded, adarms_cond, strict=True))
         ]
 
         # Aggregate MoE losses across all layers
         if all_moe_aux:
             # Stack auxiliary info from all layers
-            total_moe_loss = sum(aux.get("total_moe_loss", 0.0) for aux in all_moe_aux)
-            total_load_balance = sum(aux.get("total_load_balance_loss", 0.0) for aux in all_moe_aux)
-            total_router_z = sum(aux.get("total_router_z_loss", 0.0) for aux in all_moe_aux)
+            total_moe_loss = sum(aux.get("moe_aux_loss", 0.0) for aux in all_moe_aux)
+            total_load_balance = sum(aux.get("load_balance_loss", 0.0) for aux in all_moe_aux)
+            total_router_z = sum(aux.get("router_z_loss", 0.0) for aux in all_moe_aux)
 
             # Average expert usage across layers
-            expert_usages = [aux.get("avg_expert_usage") for aux in all_moe_aux if aux.get("avg_expert_usage") is not None]
+            expert_usages = [aux.get("expert_usage_fraction") for aux in all_moe_aux if "expert_usage_fraction" in aux]
             if expert_usages:
                 avg_expert_usage = jnp.mean(jnp.stack(expert_usages), axis=0)
             else:
@@ -311,15 +313,33 @@ class MoEModule(nn.Module):
 
         return outputs, kv_cache, aggregated_moe_aux
 
+    @at.typecheck
+    @nn.compact
+    def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
+        embedder = gemma.Embedder(
+            vocab_size=gemma.PALIGEMMA_VOCAB_SIZE,
+            embed_dim=self.configs[0].width,
+            name="embedder",
+        )
+        return embedder.encode(tokens).astype(self.embed_dtype)
+
     def init(self, use_adarms: Sequence[bool]):
         """Initialize all parameters."""
+        # Initialize embedder
         self.embed(jnp.zeros((1, 1), dtype=jnp.int32))
+
+        # Initialize transformer layers
+        # Number of tokens = 1 token per config (simplified for init)
+        num_tokens_per_config = 1
+        total_tokens = len(self.configs) * num_tokens_per_config
+
         self(
-            [jnp.zeros((1, 1, c.width)) for c in self.configs],
-            jnp.zeros((1, len(self.configs)), dtype=jnp.int32),
-            jnp.zeros((1, len(self.configs), len(self.configs)), dtype=bool),
+            [jnp.zeros((1, num_tokens_per_config, c.width)) for c in self.configs],
+            jnp.zeros((1, total_tokens), dtype=jnp.int32),
+            jnp.zeros((1, total_tokens, total_tokens), dtype=bool),
             adarms_cond=[
                 jnp.zeros((1, c.width)) if u else None for u, c in zip(use_adarms, self.configs, strict=True)
             ],
             movement_labels=jnp.zeros((1,), dtype=jnp.int32),
+            kv_cache=None,  # No KV cache during init
         )

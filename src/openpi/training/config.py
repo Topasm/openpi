@@ -855,6 +855,7 @@ _CONFIGS = [
     # B1K MoE config - Uses velocity-based online movement labeling with MoE layers
     # NOTE: This config uses MoE architecture with 2 experts (manipulation + navigation)
     # Movement labels computed from base_qvel (standard track compatible)
+    # MEMORY OPTIMIZATION: Only applies MoE to last 6 layers (saves ~60% memory vs "all")
     TrainConfig(
         name="pi0_b1k_moe",
         exp_name="openpi",
@@ -868,7 +869,7 @@ _CONFIGS = [
                 load_balancing_loss_coef=0.01,
                 router_z_loss_coef=0.001,
             ),
-            moe_layers="all",
+            moe_layers=[12, 13, 14, 15, 16, 17],  # Only last 6 layers use MoE (saves memory)
         ),
         data=LeRobotB1KDataConfigMoE(
             repo_id="behavior-1k/2025-challenge-demos",
@@ -888,7 +889,7 @@ _CONFIGS = [
             action_horizon=50,
             paligemma_variant="gemma_2b_lora",
             moe_config=moe.MoEConfig(num_experts=2, router_type="supervised"),
-            moe_layers="all",
+            moe_layers=[12, 13, 14, 15, 16, 17],  # Match above
         ).get_freeze_filter(),
         ema_decay=None,
         val_log_interval=2500,

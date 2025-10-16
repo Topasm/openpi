@@ -143,10 +143,22 @@ def _compute_validation_losses(
     # Define validation loss function (similar to train_step structure)
     @at.typecheck
     def val_loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
+        model: _model.BaseModel,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        movement_labels: at.Int[at.Array, "b"] | None,
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=False)
-        return jnp.mean(chunked_loss)
+        # Check if model has MoE capability
+        if hasattr(model, "compute_loss_with_moe") and movement_labels is not None:
+            chunked_loss, _ = model.compute_loss_with_moe(
+                rng, observation, actions, movement_labels, train=False
+            )
+            return jnp.mean(chunked_loss)
+        else:
+            # Standard Pi0 loss
+            chunked_loss = model.compute_loss(rng, observation, actions, train=False)
+            return jnp.mean(chunked_loss)
 
     def validation_step(state, batch, rng):
         """Single validation step, aligned with train_step structure."""
@@ -155,12 +167,14 @@ def _compute_validation_losses(
 
         # Handle 3-tuple format (observation, actions, batch_dict)
         if len(batch) == 3:
-            observation, actions, _ = batch
+            observation, actions, batch_dict = batch
+            movement_labels = batch_dict.get("movement_label", None)
         else:
             observation, actions = batch
+            movement_labels = None
         val_rng = jax.random.fold_in(rng, state.step)
 
-        return val_loss_fn(model, val_rng, observation, actions)
+        return val_loss_fn(model, val_rng, observation, actions, movement_labels)
 
     # JIT compile the validation step
     pvalidation_step = jax.jit(
@@ -280,7 +294,31 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
-    at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
+
+    # Check if this is a MoE model loading from non-MoE checkpoint
+    # MoE layers have different structure (moe_mlp instead of mlp)
+    flat_expected = traverse_util.flatten_dict(params_shape)
+    flat_loaded = traverse_util.flatten_dict(loaded_params)
+
+    has_moe_layers = any('moe_mlp' in str(k) for k in flat_expected.keys())
+    loaded_has_moe = any('moe_mlp' in str(k) for k in flat_loaded.keys())
+
+    if has_moe_layers and not loaded_has_moe:
+        # MoE model loading from standard checkpoint
+        # Filter out MoE-specific layers from expectation and load compatible weights only
+        logging.warning("Loading MoE model from standard checkpoint - MoE layers will be randomly initialized")
+
+        # Keep only keys that exist in both expected and loaded
+        compatible_keys = set(flat_loaded.keys()) & set(flat_expected.keys())
+
+        # Filter to only load compatible parameters
+        filtered_loaded = {k: v for k, v in flat_loaded.items() if k in compatible_keys}
+        loaded_params = traverse_util.unflatten_dict(filtered_loaded)
+
+        logging.info(f"Loaded {len(compatible_keys)} compatible parameter groups, skipped {len(flat_expected) - len(compatible_keys)} MoE-specific groups")
+    else:
+        # Standard validation for non-MoE models
+        at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
 
     # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
     return traverse_util.unflatten_dict(
@@ -350,25 +388,44 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
-    # Extract observation and actions from batch
-    # Note: Movement labels are extracted but not yet used (for future MoE implementation)
+    # Extract observation, actions, and movement labels from batch
     if len(batch) == 3:
-        observation, actions, _batch_dict = batch
+        observation, actions, batch_dict = batch
+        movement_labels = batch_dict.get("movement_label", None)
     else:
         observation, actions = batch
+        movement_labels = None
 
     @at.typecheck
     def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
+        model: _model.BaseModel,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        movement_labels: at.Int[at.Array, "b"] | None,
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        # Check if model has MoE capability
+        if hasattr(model, "compute_loss_with_moe") and movement_labels is not None:
+            chunked_loss, moe_aux = model.compute_loss_with_moe(
+                rng, observation, actions, movement_labels, train=True
+            )
+            # Add MoE auxiliary losses to the main loss
+            total_loss = jnp.mean(chunked_loss)
+            if "total_moe_loss" in moe_aux:
+                total_loss = total_loss + moe_aux["total_moe_loss"]
+            return total_loss, moe_aux
+        else:
+            # Standard Pi0 loss
+            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+            return jnp.mean(chunked_loss), {}
 
     train_rng = jax.random.fold_in(rng, state.step)
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, moe_aux), grads = nnx.value_and_grad(loss_fn, has_aux=True, argnums=diff_state)(
+        model, train_rng, observation, actions, movement_labels
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -401,6 +458,22 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+
+    # Add MoE metrics if available
+    if moe_aux:
+        if "total_moe_loss" in moe_aux:
+            info["moe_total_loss"] = moe_aux["total_moe_loss"]
+        if "total_load_balance_loss" in moe_aux:
+            info["moe_load_balance_loss"] = moe_aux["total_load_balance_loss"]
+        if "total_router_z_loss" in moe_aux:
+            info["moe_router_z_loss"] = moe_aux["total_router_z_loss"]
+        if "avg_expert_usage" in moe_aux and moe_aux["avg_expert_usage"] is not None:
+            # Log per-expert usage
+            expert_usage = moe_aux["avg_expert_usage"]
+            for i in range(len(expert_usage)):
+                info[f"moe_expert_{i}_usage"] = expert_usage[i]
+        if "num_moe_layers" in moe_aux:
+            info["moe_num_layers"] = moe_aux["num_moe_layers"]
 
     return new_state, info
 
