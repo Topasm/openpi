@@ -33,7 +33,7 @@ class MoEConfig:
     """
     num_experts: int = 2
     expert_capacity_factor: float = 1.25
-    router_type: Literal["learned", "supervised", "top_k"] = "supervised"
+    router_type: Literal["learned", "supervised", "top_k", "learned_bootstrap"] = "supervised"
     top_k: int = 1
     expert_dropout: float = 0.0
     load_balancing_loss_coef: float = 0.01
@@ -52,7 +52,7 @@ class Router(nn.Module):
     """
 
     num_experts: int
-    router_type: Literal["learned", "supervised", "top_k"]
+    router_type: Literal["learned", "supervised", "top_k", "learned_bootstrap"]
     top_k: int = 1
     dtype: str = "bfloat16"
 
@@ -81,13 +81,13 @@ class Router(nn.Module):
         if self.router_type == "supervised":
             # Use movement labels directly
             if movement_labels is None:
-                raise ValueError("movement_labels required for supervised routing")
-
-            # Map movement labels to expert indices
-            # 0 (no movement) -> expert 0 (arm expert, as fallback)
-            # 1 (arm only) -> expert 0 (arm expert)
-            # 2 (base/torso) -> expert 1 (base/torso expert)
-            expert_indices = jnp.where(movement_labels == 2, 1, 0)
+                # During inference, default to expert 0 (arm expert) if no labels provided
+                expert_indices = jnp.zeros(batch_size, dtype=jnp.int32)
+            else:
+                # Map movement labels to expert indices
+                # Label 0 (manipulation/base stationary) -> expert 0 (manipulation expert)
+                # Label 1 (navigation/base moving) -> expert 1 (navigation expert)
+                expert_indices = jnp.where(movement_labels == 1, 1, 0)
 
             # Create one-hot routing (hard assignment)
             router_probs = jax.nn.one_hot(expert_indices, self.num_experts, dtype=dtype)
@@ -151,6 +151,45 @@ class Router(nn.Module):
                 "top_k_indices": top_k_indices,
                 "top_k_probs": top_k_probs,
             }
+
+        elif self.router_type == "learned_bootstrap":
+            # Bootstrap learned router with supervision from movement labels
+            # This is used in Stage 1 to pre-train the router with supervised labels
+            # Then Stage 2 switches to pure learned routing
+            pooled = jnp.mean(x, axis=1)  # [batch, features]
+
+            # Learned router network
+            router_logits = nn.Dense(
+                self.num_experts,
+                dtype=dtype,
+                kernel_init=nn.initializers.normal(stddev=0.01),
+                name="router_dense",
+            )(pooled)  # [batch, num_experts]
+
+            # Softmax to get probabilities
+            router_probs = jax.nn.softmax(router_logits, axis=-1)
+
+            # Broadcast to all tokens in sequence
+            router_probs = router_probs[:, None, :]  # [batch, 1, num_experts]
+            router_probs = jnp.broadcast_to(router_probs, (batch_size, seq_len, self.num_experts))
+
+            router_aux = {
+                "router_logits": router_logits,
+                "router_probs_pooled": router_probs[:, 0, :],
+            }
+
+            # Add supervision loss if labels are provided (for bootstrapping)
+            if movement_labels is not None and not deterministic:
+                # Ground truth expert indices from movement labels
+                target_indices = jnp.where(movement_labels == 1, 1, 0)
+                target_probs = jax.nn.one_hot(target_indices, self.num_experts, dtype=dtype)
+
+                # Cross-entropy loss: teach router to predict correct expert from labels
+                log_probs = jax.nn.log_softmax(router_logits, axis=-1)
+                supervision_loss = -jnp.sum(target_probs * log_probs, axis=-1)
+                router_aux["router_supervision_loss"] = jnp.mean(supervision_loss)
+            else:
+                router_aux["router_supervision_loss"] = 0.0
 
         else:
             raise ValueError(f"Unknown router_type: {self.router_type}")
@@ -309,8 +348,10 @@ class MoEFeedForward(nn.Module):
         else:
             aux["router_z_loss"] = 0.0
 
-        # Total auxiliary loss
-        aux["moe_aux_loss"] = aux["load_balance_loss"] + aux["router_z_loss"]
+        # Total auxiliary loss (include supervision loss for bootstrap training)
+        supervision_loss = router_aux.get("router_supervision_loss", 0.0)
+        aux["router_supervision_loss"] = supervision_loss
+        aux["moe_aux_loss"] = aux["load_balance_loss"] + aux["router_z_loss"] + supervision_loss
 
         # Expert usage statistics
         expert_usage = jnp.sum(router_probs, axis=(0, 1))  # [num_experts]
@@ -362,6 +403,7 @@ def aggregate_moe_losses(moe_aux_list: list[dict]) -> dict:
     # Aggregate losses
     total_load_balance_loss = sum(aux.get("load_balance_loss", 0.0) for aux in moe_aux_list)
     total_router_z_loss = sum(aux.get("router_z_loss", 0.0) for aux in moe_aux_list)
+    total_router_supervision_loss = sum(aux.get("router_supervision_loss", 0.0) for aux in moe_aux_list)
     total_moe_loss = sum(aux.get("moe_aux_loss", 0.0) for aux in moe_aux_list)
 
     # Aggregate expert usage statistics
@@ -375,6 +417,7 @@ def aggregate_moe_losses(moe_aux_list: list[dict]) -> dict:
         "total_moe_loss": total_moe_loss,
         "total_load_balance_loss": total_load_balance_loss,
         "total_router_z_loss": total_router_z_loss,
+        "total_router_supervision_loss": total_router_supervision_loss,
         "avg_expert_usage": avg_expert_usage,
         "num_moe_layers": len(moe_aux_list),
     }

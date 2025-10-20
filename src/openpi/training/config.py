@@ -900,6 +900,107 @@ _CONFIGS = [
         num_workers=0,  # Disable multiprocessing due to BehaviorLeRobotDataset pickle issues
     ),
 
+    # ============================================================================
+    # TWO-STAGE MoE TRAINING with Bootstrap
+    # ============================================================================
+    # Stage 1: Bootstrap learned router with supervised labels (10k steps)
+    # - Use "learned_bootstrap" router type
+    # - Trains router to predict expert from input features
+    # - Supervised by movement labels (velocity-based)
+    # - Experts learn specialization (manipulation vs navigation)
+    TrainConfig(
+        name="pi0_b1k_moe_bootstrap_stage1",
+        exp_name="openpi_moe_bootstrap",
+        project_name="B1K_MoE_TwoStage",
+        model=pi0_moe.Pi0MoEConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            moe_config=moe.MoEConfig(
+                num_experts=2,
+                router_type="learned_bootstrap",  # Bootstrap mode: learned + supervision
+                load_balancing_loss_coef=0.01,
+                router_z_loss_coef=0.001,
+            ),
+            moe_layers=[12, 13, 14, 15, 16, 17],  # Last 6 layers
+        ),
+        data=LeRobotB1KDataConfigMoE(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(190)),
+                behavior_dataset_root=DATASETS_BASE_DIR / "2025-challenge-demos",
+            ),
+            # Need movement labels for supervision in Stage 1
+            enable_movement_labels=True,
+            velocity_threshold=0.01,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_base/params"
+        ),
+        num_train_steps=10_000,  # Just 10k steps for bootstrapping
+        freeze_filter=pi0_moe.Pi0MoEConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            moe_config=moe.MoEConfig(num_experts=2, router_type="learned_bootstrap"),
+            moe_layers=[12, 13, 14, 15, 16, 17],
+        ).get_freeze_filter(),
+        ema_decay=None,
+        val_log_interval=1000,  # Validate more frequently
+        val_repo_id="behavior-1k/2025-challenge-demos",
+        val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=0,
+    ),
+
+    # Stage 2: Fine-tune with pure learned routing (40k steps)
+    # - Switch to "learned" router type (no supervision)
+    # - Load from Stage 1 checkpoint
+    # - Router parameters are already initialized from bootstrap
+    # - No movement labels needed!
+    TrainConfig(
+        name="pi0_b1k_moe_bootstrap_stage2",
+        exp_name="openpi_moe_bootstrap",
+        project_name="B1K_MoE_TwoStage",
+        model=pi0_moe.Pi0MoEConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            moe_config=moe.MoEConfig(
+                num_experts=2,
+                router_type="learned",  # Pure learned routing (no supervision)
+                load_balancing_loss_coef=0.01,
+                router_z_loss_coef=0.001,
+            ),
+            moe_layers=[12, 13, 14, 15, 16, 17],  # Same as Stage 1
+        ),
+        data=LeRobotB1KDataConfig(  # Regular config, no movement labels!
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(190)),
+                behavior_dataset_root=DATASETS_BASE_DIR / "2025-challenge-demos",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            # Load from Stage 1 checkpoint (will be available after Stage 1 completes)
+            "./outputs/checkpoints/pi0_b1k_moe_bootstrap_stage1/9999/params"
+        ),
+        num_train_steps=40_000,  # Continue training for 40k more steps
+        freeze_filter=pi0_moe.Pi0MoEConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            moe_config=moe.MoEConfig(num_experts=2, router_type="learned"),
+            moe_layers=[12, 13, 14, 15, 16, 17],
+        ).get_freeze_filter(),
+        ema_decay=None,
+        val_log_interval=2500,
+        val_repo_id="behavior-1k/2025-challenge-demos",
+        val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=0,
+    ),
+
     #
     # Fine-tuning Libero configs.
     #

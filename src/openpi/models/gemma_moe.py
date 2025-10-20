@@ -235,12 +235,12 @@ class MoEModule(nn.Module):
         if kv_cache is not None:
             # Split KV cache for each layer
             kv_caches = [(kv_cache[0][layer_idx], kv_cache[1][layer_idx]) for layer_idx in range(self.configs[0].depth)]
-            new_kv_caches_k = []
-            new_kv_caches_v = []
         else:
             kv_caches = [None] * self.configs[0].depth
-            new_kv_caches_k = None
-            new_kv_caches_v = None
+
+        # Always collect new KV caches (for both initial pass and subsequent passes)
+        new_kv_caches_k = []
+        new_kv_caches_v = []
 
         for layer_idx in range(self.configs[0].depth):
             block = nn.remat(
@@ -265,8 +265,8 @@ class MoEModule(nn.Module):
                 deterministic,
             )
 
-            # Collect new KV cache for this layer
-            if kv_cache is not None and layer_kv_cache is not None:
+            # Collect new KV cache for this layer (always, not just when input kv_cache exists)
+            if layer_kv_cache is not None:
                 new_kv_caches_k.append(layer_kv_cache[0])
                 new_kv_caches_v.append(layer_kv_cache[1])
 
@@ -274,7 +274,7 @@ class MoEModule(nn.Module):
                 all_moe_aux.append(moe_aux)
 
         # Reconstruct full KV cache
-        if kv_cache is not None:
+        if new_kv_caches_k:  # If we collected any KV caches
             kv_cache = (jnp.stack(new_kv_caches_k), jnp.stack(new_kv_caches_v))
         else:
             kv_cache = None
