@@ -55,7 +55,24 @@ def create_trained_policy(
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+
+    # Create data config for inference
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+
+    # IMPORTANT: Disable movement labels during inference
+    # Movement labels are only needed for training the router with supervision.
+    # During inference, the frozen router uses learned weights to make routing decisions.
+    if hasattr(data_config, 'enable_movement_labels') and data_config.enable_movement_labels:
+        import dataclasses
+        logging.info(
+            "Disabling movement labels for inference (router will use learned weights). "
+            "Movement labels are only needed during training for router supervision."
+        )
+        # Create new data config with movement labels disabled
+        modified_data_factory = dataclasses.replace(train_config.data, enable_movement_labels=False)
+        # Recreate data config with labels disabled
+        data_config = modified_data_factory.create(train_config.assets_dirs, train_config.model)
+
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
