@@ -208,6 +208,31 @@ def preprocess_observation(
     )
 
 
+def _convert_string_keys_to_int(params: at.Params) -> at.Params:
+    """Convert string keys to integers in nested dictionaries.
+
+    This is needed because orbax.checkpoint.transform_utils.intersect_trees
+    converts integer dictionary keys to strings. We need to convert them back
+    for nnx.Sequential layers which use integer keys.
+
+    Args:
+        params: Parameter dictionary with potentially stringified integer keys.
+
+    Returns:
+        Parameter dictionary with integer keys where applicable.
+    """
+    if isinstance(params, dict):
+        new_dict = {}
+        for k, v in params.items():
+            # Convert string keys to int if they represent integers
+            if isinstance(k, str) and k.isdigit():
+                new_dict[int(k)] = _convert_string_keys_to_int(v)
+            else:
+                new_dict[k] = _convert_string_keys_to_int(v)
+        return new_dict
+    return params
+
+
 @dataclasses.dataclass(frozen=True)
 class BaseModelConfig(abc.ABC):
     """Configuration shared by all models. Specific models should inherit from this class, and implement the `create`
@@ -236,6 +261,8 @@ class BaseModelConfig(abc.ABC):
         graphdef, state = nnx.split(model)
         if remove_extra_params:
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
+            # intersect_trees converts integer dict keys to strings, convert them back
+            params = _convert_string_keys_to_int(params)
         at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
@@ -329,4 +356,13 @@ def restore_params(
     flat_params = traverse_util.flatten_dict(params)
     if all(kp[-1] == "value" for kp in flat_params):
         flat_params = {kp[:-1]: v for kp, v in flat_params.items()}
+
+    # Convert string keys to integers for nnx.Sequential layers
+    # When checkpoints are saved, dictionary keys in key paths are converted to strings during serialization
+    # We need to convert them back to integers for layers like task_router, nav_expert, manip_expert
+    def convert_key_tuple(key_tuple):
+        """Convert string keys in key tuple to integers where applicable."""
+        return tuple(int(k) if isinstance(k, str) and k.isdigit() else k for k in key_tuple)
+
+    flat_params = {convert_key_tuple(k): v for k, v in flat_params.items()}
     return traverse_util.unflatten_dict(flat_params)
