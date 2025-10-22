@@ -82,6 +82,32 @@ class DualHeadWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen=True)
+class AuxLossWeightLoader(WeightLoader):
+    """Loads weights for Pi0AuxLoss model from a standard Pi0 checkpoint.
+
+    This loader:
+    1. Loads the base Pi0 weights (PaliGemma + action_out_proj + LoRA if present)
+    2. Initializes task_classifier randomly (auxiliary head)
+
+    Note: Unlike MoE, the action_out_proj is compatible and can be loaded from checkpoint.
+    Only the task_classifier is new and needs random initialization.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        # Load checkpoint
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+
+        # Only skip task_classifier (new auxiliary head)
+        # action_out_proj is compatible and will be loaded
+        skip_regex = ".*(task_classifier).*"
+        missing_regex = ".*(lora|task_classifier).*"
+
+        return _merge_params(loaded_params, params, missing_regex=missing_regex, skip_regex=skip_regex)
+
+
+@dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
     """Loads weights from the official PaliGemma checkpoint.
 

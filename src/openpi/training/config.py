@@ -19,6 +19,7 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.pi0_moe as pi0_moe
 import openpi.models.pi0_dual_head as pi0_dual_head
+import openpi.models.pi0_aux_loss as pi0_aux_loss
 import openpi.models.moe as moe
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -933,6 +934,48 @@ _CONFIGS = [
             "gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=50_000,
         freeze_filter=pi0_dual_head.Pi0DualHeadConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        val_log_interval=2500,
+        val_repo_id="behavior-1k/2025-challenge-demos",
+        val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=0,  # Disable multiprocessing due to BehaviorLeRobotDataset pickle issues
+    ),
+
+    # B1K Auxiliary Loss Training Config
+    # Uses auxiliary task classification (nav vs manip) to help model learn task-aware representations
+    # Simpler than MoE - no expert gating, just multi-task learning
+    TrainConfig(
+        name="pi0_b1k_aux_loss",
+        exp_name="openpi",
+        project_name="B1K_AuxLoss",
+        model=pi0_aux_loss.Pi0AuxLossConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            aux_loss_coef=0.1,  # Weight for auxiliary task classification loss
+            task_classifier_hidden_dim=512,  # Hidden dim for task classifier (1024 // 2)
+        ),
+        data=LeRobotB1KDataConfigMoE(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(190)),
+                behavior_dataset_root=DATASETS_BASE_DIR / "2025-challenge-demos",
+            ),
+            # Velocity-based movement labeling for auxiliary task supervision
+            enable_movement_labels=True,
+            velocity_threshold=0.01,  # L2 norm threshold for base velocity
+        ),
+        weight_loader=weight_loaders.AuxLossWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=50_000,
+        freeze_filter=pi0_aux_loss.Pi0AuxLossConfig(
             action_horizon=50,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
