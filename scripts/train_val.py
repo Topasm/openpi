@@ -473,11 +473,16 @@ def train_step(
             info["moe_load_balance_loss"] = moe_aux["total_load_balance_loss"]
         if "total_router_z_loss" in moe_aux:
             info["moe_router_z_loss"] = moe_aux["total_router_z_loss"]
+        if "total_router_supervision_loss" in moe_aux:
+            info["moe_router_supervision_loss"] = moe_aux["total_router_supervision_loss"]
         if "avg_expert_usage" in moe_aux and moe_aux["avg_expert_usage"] is not None:
             # Log per-expert usage
             expert_usage = moe_aux["avg_expert_usage"]
             for i in range(len(expert_usage)):
                 info[f"moe_expert_{i}_usage"] = expert_usage[i]
+            # Log expert balance ratio (how balanced the usage is)
+            if len(expert_usage) == 2:
+                info["moe_expert_balance"] = jnp.min(expert_usage) / jnp.max(expert_usage)
         if "num_moe_layers" in moe_aux:
             info["moe_num_layers"] = moe_aux["num_moe_layers"]
 
