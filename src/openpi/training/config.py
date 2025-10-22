@@ -18,6 +18,7 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.pi0_moe as pi0_moe
+import openpi.models.pi0_dual_head as pi0_dual_head
 import openpi.models.moe as moe
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -890,6 +891,51 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora",
             moe_config=moe.MoEConfig(num_experts=2, router_type="supervised"),
             moe_layers=[12, 13, 14, 15, 16, 17],  # Match above
+        ).get_freeze_filter(),
+        ema_decay=None,
+        val_log_interval=2500,
+        val_repo_id="behavior-1k/2025-challenge-demos",
+        val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=0,  # Disable multiprocessing due to BehaviorLeRobotDataset pickle issues
+    ),
+
+    # B1K Dual-Head config - Simplified MoE using separate action heads
+    # NOTE: This config uses dual action heads (nav_head + manip_head) instead of modifying Gemma
+    # Movement labels computed from base_qvel (standard track compatible)
+    # ADVANTAGES: Easier to fine-tune, more modular, less memory usage
+    TrainConfig(
+        name="pi0_b1k_dual_head",
+        exp_name="openpi",
+        project_name="B1K_DualHead",
+        model=pi0_dual_head.Pi0DualHeadConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            nav_action_dim=3,  # Base movement (x, y, yaw velocities)
+            manip_action_dim=20,  # trunk(4) + left_arm(7) + right_arm(7) + grippers(2)
+            router_loss_coef=0.1,  # Weight for router loss
+            freeze_router_after_steps=10000,  # Freeze router after 10k steps (hybrid training)
+        ),
+        data=LeRobotB1KDataConfigMoE(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(190)),
+                behavior_dataset_root=DATASETS_BASE_DIR / "2025-challenge-demos",
+            ),
+            # Velocity-based movement labeling (standard track compatible, uses only base_qvel)
+            enable_movement_labels=True,
+            velocity_threshold=0.01,  # L2 norm threshold for base velocity
+        ),
+        weight_loader=weight_loaders.DualHeadWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=50_000,
+        freeze_filter=pi0_dual_head.Pi0DualHeadConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
         val_log_interval=2500,

@@ -55,6 +55,33 @@ class CheckpointWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen=True)
+class DualHeadWeightLoader(WeightLoader):
+    """Loads weights for Pi0DualHead (TRUE MoE) model from a standard Pi0 checkpoint.
+
+    This loader:
+    1. Loads the base Pi0 weights (PaliGemma + LoRA if present)
+    2. Skips the old action_out_proj (will be randomly initialized)
+    3. Initializes task_router, nav_expert, manip_expert, action_out_proj randomly
+
+    Note: In TRUE MoE architecture, action_out_proj is kept but used differently.
+    It now projects the gated expert features instead of LLM outputs directly.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        # Load checkpoint
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+
+        # Skip action_out_proj from checkpoint (incompatible - projects different features)
+        # Initialize task_router, nav_expert, manip_expert, action_out_proj randomly
+        skip_regex = ".*(action_out_proj|task_router|nav_expert|manip_expert).*"
+        missing_regex = ".*(lora|task_router|nav_expert|manip_expert|action_out_proj).*"
+
+        return _merge_params(loaded_params, params, missing_regex=missing_regex, skip_regex=skip_regex)
+
+
+@dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
     """Loads weights from the official PaliGemma checkpoint.
 
@@ -73,28 +100,80 @@ class PaliGemmaWeightLoader(WeightLoader):
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
-def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
+def _flatten_dict_with_int_keys(d, parent_key='', sep='/'):
+    """Flatten a nested dict, converting integer keys to strings."""
+    items = []
+    for k, v in d.items():
+        # Convert integer keys to strings
+        new_key = f"{parent_key}{sep}{str(k)}" if parent_key else str(k)
+        if isinstance(v, dict):
+            items.extend(_flatten_dict_with_int_keys(v, new_key, sep=sep).items())
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
+
+def _unflatten_dict_with_int_keys(d, sep='/'):
+    """Unflatten a dict, converting numeric string keys back to integers where appropriate."""
+    result = {}
+    for key, value in d.items():
+        parts = key.split(sep)
+        current = result
+        for i, part in enumerate(parts[:-1]):
+            # Try to convert to int if it looks like a number
+            try:
+                part_key = int(part)
+            except ValueError:
+                part_key = part
+
+            if part_key not in current:
+                current[part_key] = {}
+            current = current[part_key]
+
+        # Handle the last part
+        last_part = parts[-1]
+        try:
+            last_key = int(last_part)
+        except ValueError:
+            last_key = last_part
+
+        current[last_key] = value
+    return result
+
+
+def _merge_params(
+    loaded_params: at.Params, params: at.Params, *, missing_regex: str, skip_regex: str | None = None
+) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 
     Args:
         loaded_params: The parameters to merge.
         params: The reference parameters.
         missing_regex: A regex pattern for all missing keys that should be merged from the reference parameters.
+        skip_regex: Optional regex pattern for keys to skip when loading from checkpoint.
 
     Returns:
         A new dictionary with the merged parameters.
     """
-    flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
-    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+    # Use custom flatten that handles integer keys (e.g., from nnx.Sequential)
+    flat_ref = _flatten_dict_with_int_keys(params, sep="/")
+    flat_loaded = _flatten_dict_with_int_keys(loaded_params, sep="/")
 
     # First, take all weights that are a subset of the reference weights.
     result = {}
+    skip_pattern = re.compile(skip_regex) if skip_regex else None
+
     for k, v in flat_loaded.items():
+        # Skip if matches skip pattern
+        if skip_pattern and skip_pattern.fullmatch(k):
+            logger.info(f"Skipping checkpoint key (skip_regex match): {k}")
+            continue
+
         if k in flat_ref:
             if v.dtype == flat_ref[k].dtype:
                 result[k] = v
             else:
-                print(f"Warning: {k} has dtype {v.dtype} but reference has dtype {flat_ref[k].dtype}")
+                logger.warning(f"{k} has dtype {v.dtype} but reference has dtype {flat_ref[k].dtype}")
                 result[k] = v.astype(flat_ref[k].dtype)
     flat_loaded.clear()
 
@@ -102,6 +181,7 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     pattern = re.compile(missing_regex)
     for k in {k for k in flat_ref if pattern.fullmatch(k)}:
         if k not in result:
+            logger.info(f"Initializing randomly (missing from checkpoint): {k}")
             result[k] = flat_ref[k]
 
-    return flax.traverse_util.unflatten_dict(result, sep="/")
+    return _unflatten_dict_with_int_keys(result, sep="/")

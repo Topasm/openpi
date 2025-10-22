@@ -404,8 +404,14 @@ def train_step(
         actions: _model.Actions,
         movement_labels: at.Int[at.Array, "b"] | None,
     ):
+        # Check if model has dual-head capability (Pi0DualHead)
+        if hasattr(model, "compute_loss_with_routing"):
+            total_loss, metrics = model.compute_loss_with_routing(
+                rng, observation, actions, movement_labels, train=True
+            )
+            return total_loss, metrics
         # Check if model has MoE capability
-        if hasattr(model, "compute_loss_with_moe") and movement_labels is not None:
+        elif hasattr(model, "compute_loss_with_moe") and movement_labels is not None:
             chunked_loss, moe_aux = model.compute_loss_with_moe(
                 rng, observation, actions, movement_labels, train=True
             )
