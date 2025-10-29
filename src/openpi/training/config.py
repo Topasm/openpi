@@ -17,10 +17,9 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
-import openpi.models.pi0_moe as pi0_moe
 import openpi.models.pi0_dual_head as pi0_dual_head
 import openpi.models.pi0_aux_loss as pi0_aux_loss
-import openpi.models.moe as moe
+import openpi.models.pi0_hierarchical as pi0_hierarchical
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
@@ -485,6 +484,95 @@ class LeRobotB1KDataConfigMoE(DataConfigFactory):
             )
             # Add to data transforms (not model transforms - we want it before normalization)
             data_transforms = data_transforms.push(inputs=[movement_labeler])
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            use_quantile_norm=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotB1KHierarchicalDataConfig(DataConfigFactory):
+    """B1K data config with hierarchical skill annotations for multi-task training.
+
+    This config adds skill annotation transforms to enable the model to predict both:
+    1. High-level skills (text, via language modeling)
+    2. Low-level actions (continuous, via flow matching)
+
+    Args:
+        annotation_root: Path to skill annotation JSON files (task-XXXX/episode_XXXXXXXX.json)
+        skill_prediction_window: Number of frames at skill start to predict skill text (default: 10)
+        enable_memory: If True, add past skills memory for Phase 1 (ProVideLLM-style cache)
+        action_sequence_keys: Keys for action sequences in the dataset
+    """
+
+    annotation_root: str = "/data3/BEHAVIOR-1K/2025-challenge-demos/annotations"
+    skill_prediction_window: int = 10
+    enable_memory: bool = False  # Phase 0: False, Phase 1: True
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Import hierarchical transforms
+        from openpi.training.hierarchical_transforms import AddSkillAnnotation, TokenizeSkills, AddPastSkillsCache, TokenizeMemory
+
+        # Same repack transform as base B1K config
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/egocentric_camera": "observation.images.rgb.head",
+                        "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+                        "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Start with standard B1K data transforms
+        data_transforms = _transforms.Group(
+            inputs=[b1k_policy.B1kInputs(
+                action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[b1k_policy.B1kOutputs(action_dim=23)],
+        )
+
+        # Add hierarchical skill annotation transform
+        skill_annotation_transform = AddSkillAnnotation(
+            annotation_root=self.annotation_root,
+            cache_annotations=True,
+            skill_format="text",
+            skill_prediction_window=self.skill_prediction_window
+        )
+
+        # Add skill tokenization transform (must come before model transforms)
+        skill_tokenize_transform = TokenizeSkills(max_len=64)
+
+        # Optionally add memory transform for Phase 1
+        if self.enable_memory:
+            memory_transform = AddPastSkillsCache(
+                annotation_root=self.annotation_root,
+                cache_annotations=True,
+                format_with_tokens=True,
+                special_token="<L>"
+            )
+            memory_tokenize_transform = TokenizeMemory(max_memory_len=256)
+            data_transforms = data_transforms.push(
+                inputs=[skill_annotation_transform, memory_transform, skill_tokenize_transform, memory_tokenize_transform]
+            )
+        else:
+            data_transforms = data_transforms.push(
+                inputs=[skill_annotation_transform, skill_tokenize_transform]
+            )
 
         # Model transforms include things like tokenizing the prompt and action targets
         model_transforms = ModelTransformFactory()(model_config)
@@ -976,6 +1064,49 @@ _CONFIGS = [
             "gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=50_000,
         freeze_filter=pi0_aux_loss.Pi0AuxLossConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        val_log_interval=2500,
+        val_repo_id="behavior-1k/2025-challenge-demos",
+        val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=0,  # Disable multiprocessing due to BehaviorLeRobotDataset pickle issues
+    ),
+
+    # B1K Hierarchical VLA config - Multi-task learning with skill + action prediction
+    # Phase 0: Skill prediction at task boundaries (no memory)
+    # Phase 1: Long-horizon memory with ProVideLLM-style cache
+    TrainConfig(
+        name="pi0_b1k_hierarchical",
+        exp_name="openpi_hierarchical",
+        project_name="B1K_Hierarchical",
+        model=pi0_hierarchical.Pi0HierarchicalConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            skill_loss_weight=10.0,  # Higher weight to compensate for fewer skill samples
+            action_loss_weight=1.0,
+            max_skill_tokens=64,
+        ),
+        data=LeRobotB1KHierarchicalDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(190)),
+                behavior_dataset_root=DATASETS_BASE_DIR / "2025-challenge-demos",
+            ),
+            annotation_root="/home/seonghyeon/Postech-Behavior-Challenge/dataset/2025-challenge-demos/annotations",
+            skill_prediction_window=10,  # Predict skill at first 10 frames of each skill
+            enable_memory=False,  # Phase 0: False, Phase 1: True
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=50_000,
+        freeze_filter=pi0_hierarchical.Pi0HierarchicalConfig(
             action_horizon=50,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
