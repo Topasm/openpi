@@ -15,6 +15,13 @@ import numpy as np
 
 from openpi.training import skill_utils
 
+# Import EOS_SKILL_TOKEN for Phase 3: Dense Prediction
+try:
+    from openpi.models.tokenizer import EOS_SKILL_TOKEN
+except ImportError:
+    # Fallback if tokenizer module not available
+    EOS_SKILL_TOKEN = "<EOS_SKILL>"
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,11 +33,16 @@ class AddSkillAnnotation:
     skill information at each timestep. This enables the model to learn hierarchical
     representations where it predicts both the high-level skill and the low-level action.
 
-    IMPORTANT: For efficiency, we only predict skill text at the beginning of each skill
-    (within the first N frames, where N=skill_prediction_window). This avoids redundant
-    predictions since the skill remains constant throughout its duration (which can be
-    hundreds of frames). The `predict_skill` flag indicates whether this frame should
-    contribute to the skill prediction loss.
+    Phase 0/1 Mode (sparse prediction):
+        - Only predict skill text at the beginning of each skill (first N frames)
+        - skill_prediction_window determines the window size (default: 10)
+        - Creates ~1-5% of frames contributing to skill loss
+
+    Phase 3 Mode (dense prediction with EOS):
+        - Predict concise skill summary at EVERY frame
+        - Append <EOS_SKILL> token only at the last frame of each skill
+        - Model learns skill boundaries through EOS token detection
+        - Set use_dense_prediction=True and use_eos_token=True
 
     Args:
         annotation_root: Root directory containing skill annotation JSON files.
@@ -38,9 +50,10 @@ class AddSkillAnnotation:
         cache_annotations: If True, cache loaded annotations in memory to avoid repeated file reads
         skill_format: Format for skill representation - "text" or "dict"
         skill_prediction_window: Number of frames at the start of each skill where we predict
-                               the skill text (default: 10). This creates ~1-5% of frames
-                               contributing to skill loss, which is efficient but still provides
-                               sufficient training signal.
+                               the skill text (default: 10). Only used when use_dense_prediction=False.
+        use_dense_prediction: If True, predict skill at EVERY frame (Phase 3 mode)
+        use_eos_token: If True, append <EOS_SKILL> token at end of skill (Phase 3 mode)
+        use_concise_format: If True, use concise JSON format without object numbers (Phase 3 mode)
     """
 
     def __init__(
@@ -48,18 +61,34 @@ class AddSkillAnnotation:
         annotation_root: str | Path,
         cache_annotations: bool = True,
         skill_format: str = "text",
-        skill_prediction_window: int = 10
+        skill_prediction_window: int = 10,
+        use_dense_prediction: bool = False,
+        use_eos_token: bool = False,
+        use_concise_format: bool = False
     ):
         self.annotation_root = Path(annotation_root)
         self.cache_annotations = cache_annotations
         self.skill_format = skill_format
         self.skill_prediction_window = skill_prediction_window
+        self.use_dense_prediction = use_dense_prediction
+        self.use_eos_token = use_eos_token
+        self.use_concise_format = use_concise_format
 
         if skill_format not in ["text", "dict"]:
             raise ValueError(f"skill_format must be 'text' or 'dict', got {skill_format}")
 
         # Cache for annotations: episode_index -> annotation_data
         self._annotation_cache = {} if cache_annotations else None
+
+        # Log configuration
+        if use_dense_prediction:
+            logger.info("Phase 3 Mode: Dense prediction enabled (predict at every frame)")
+            if use_eos_token:
+                logger.info(f"  EOS token enabled: appending '{EOS_SKILL_TOKEN}' at end of skills")
+            if use_concise_format:
+                logger.info("  Using concise JSON format (no object numbers)")
+        else:
+            logger.info(f"Phase 0/1 Mode: Sparse prediction (window size: {skill_prediction_window} frames)")
 
     def __call__(self, data: dict) -> dict:
         """
@@ -113,11 +142,10 @@ class AddSkillAnnotation:
         try:
             annotation = self._load_annotation(episode_idx, task_idx)
 
-            # Get skill prediction info (checks if within prediction window)
-            should_predict, skill = skill_utils.get_skill_prediction_info(
+            # Find current skill at this frame
+            skill = skill_utils.get_skill_at_frame(
                 annotation["skill_annotation"],
-                frame_idx,
-                window_size=self.skill_prediction_window
+                frame_idx
             )
 
             if skill is None:
@@ -130,10 +158,40 @@ class AddSkillAnnotation:
                 data["skill_idx"] = -1
             else:
                 data["has_skill"] = True
-                data["predict_skill"] = should_predict  # NEW: Whether to predict at this frame
-                data["skill_text"] = skill_utils.skill_to_text(skill)
+
+                # Determine if we should predict at this frame
+                if self.use_dense_prediction:
+                    # Phase 3: Predict at EVERY frame
+                    should_predict = True
+                else:
+                    # Phase 0/1: Only predict in the first N frames of the skill
+                    should_predict = skill_utils.is_within_skill_prediction_window(
+                        frame_idx, skill, window_size=self.skill_prediction_window
+                    )
+
+                data["predict_skill"] = should_predict
+
+                # Generate skill text
+                if self.use_concise_format:
+                    # Phase 3: Use concise JSON format without object numbers
+                    skill_text = skill_utils.create_concise_skill_summary_json(skill)
+                else:
+                    # Phase 0/1: Use full format
+                    skill_text = skill_utils.skill_to_text(skill)
+
+                # Check if this is the last frame of the skill
+                start_frame, end_frame = skill["frame_duration"]
+                is_last_frame = (frame_idx == end_frame)
+
+                # Append EOS token if enabled and at last frame
+                if self.use_eos_token and is_last_frame:
+                    skill_text = f"{skill_text} {EOS_SKILL_TOKEN}"
+                    logger.debug(f"Appended EOS token at frame {frame_idx} (skill end)")
+
+                data["skill_text"] = skill_text
                 data["skill_dict"] = skill_utils.skill_to_dict(skill)
                 data["skill_idx"] = skill["skill_idx"]
+                data["is_skill_end_frame"] = is_last_frame  # Metadata for debugging
 
         except FileNotFoundError as e:
             logger.warning(f"Annotation not found for episode {episode_idx}: {e}")
@@ -292,15 +350,22 @@ class TokenizeSkills:
     skill_tokens and skill_masks using the PaliGemma tokenizer.
 
     Args:
-        tokenizer: PaliGemma tokenizer instance (optional, will create default if None)
+        tokenizer: Tokenizer instance (optional, will create default if None)
         max_len: Maximum length for skill tokens (default: 64)
+        use_hierarchical_tokenizer: If True, use HierarchicalTokenizer with EOS_SKILL support (Phase 3)
     """
 
-    def __init__(self, tokenizer=None, max_len: int = 64):
+    def __init__(self, tokenizer=None, max_len: int = 64, use_hierarchical_tokenizer: bool = False):
         if tokenizer is None:
-            # Create default tokenizer
-            from openpi.models.tokenizer import PaligemmaTokenizer
-            self.tokenizer = PaligemmaTokenizer(max_len=max_len)
+            if use_hierarchical_tokenizer:
+                # Phase 3: Use HierarchicalTokenizer with special token support
+                from openpi.models.tokenizer import HierarchicalTokenizer
+                self.tokenizer = HierarchicalTokenizer(max_len=max_len, add_eos_skill_token=True)
+                logger.info("Using HierarchicalTokenizer with <EOS_SKILL> token support")
+            else:
+                # Phase 0/1: Use standard PaligemmaTokenizer
+                from openpi.models.tokenizer import PaligemmaTokenizer
+                self.tokenizer = PaligemmaTokenizer(max_len=max_len)
         else:
             self.tokenizer = tokenizer
         self.max_len = max_len

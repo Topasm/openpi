@@ -75,11 +75,15 @@ class Pi0HierarchicalConfig(pi0_config.Pi0Config):
         skill_loss_weight: Weight for skill prediction loss (default: 10.0)
         action_loss_weight: Weight for action prediction loss (default: 1.0)
         max_skill_tokens: Maximum number of tokens for skill text (default: 64)
+        use_hierarchical_tokenizer: Whether to use HierarchicalTokenizer with special tokens (Phase 3)
+        vocab_size_override: Override vocabulary size (use when adding special tokens like <EOS_SKILL>)
     """
 
     skill_loss_weight: float = 10.0
     action_loss_weight: float = 1.0
     max_skill_tokens: int = 64  # Maximum length of skill text
+    use_hierarchical_tokenizer: bool = False  # Phase 3: Enable HierarchicalTokenizer
+    vocab_size_override: Optional[int] = None  # Override vocab size for special tokens
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0Hierarchical":
@@ -106,6 +110,7 @@ class Pi0Hierarchical(_model.BaseModel):
         self.skill_loss_weight = config.skill_loss_weight
         self.action_loss_weight = config.action_loss_weight
         self.max_skill_tokens = config.max_skill_tokens
+        self.use_hierarchical_tokenizer = config.use_hierarchical_tokenizer
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -147,7 +152,14 @@ class Pi0Hierarchical(_model.BaseModel):
         # Skill prediction head: Use PaliGemma's vocabulary for text generation
         # The PaliGemma expert already has an output projection to vocabulary
         # We'll use the llm's unembedding layer (tied with embedding)
-        self.vocab_size = _gemma.PALIGEMMA_VOCAB_SIZE  # 257,152
+        if config.vocab_size_override is not None:
+            self.vocab_size = config.vocab_size_override
+            logger.info(f"Using custom vocabulary size: {self.vocab_size}")
+            # Note: When using HierarchicalTokenizer with special tokens,
+            # the embedding layer will need to be resized. This is handled
+            # by calling resize_token_embeddings after model initialization.
+        else:
+            self.vocab_size = _gemma.PALIGEMMA_VOCAB_SIZE  # 257,152
 
     def embed_prefix(self, observation: _model.Observation):
         """
@@ -524,6 +536,134 @@ class Pi0Hierarchical(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def infer_with_memory(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        memory_text: Optional[str] = None,
+        tokenizer = None,
+        num_steps: int = 10,
+        generate_skill: bool = False,
+        max_skill_length: int = 32
+    ) -> tuple[_model.Actions, Optional[str]]:
+        """
+        Inference with dynamic memory support for Phase 3.
+
+        This method takes vision+text memory input, generates actions,
+        and optionally generates skill predictions for EOS detection.
+
+        Args:
+            rng: Random key
+            observation: Current observation (images, state, task prompt)
+            memory_text: Text memory from past completed skills (optional)
+            tokenizer: Tokenizer for memory text and skill generation (optional)
+            num_steps: Number of ODE integration steps for action sampling
+            generate_skill: Whether to generate skill text (for EOS detection)
+            max_skill_length: Maximum length for skill generation
+
+        Returns:
+            (actions, skill_text) tuple:
+                - actions: Predicted actions [B, action_horizon, action_dim]
+                - skill_text: Generated skill text (if generate_skill=True), else None
+
+        Example:
+            # Phase 3 inference with memory
+            memory_text = "<PAST_SKILL>{...}</PAST_SKILL> <PAST_SKILL>{...}</PAST_SKILL>"
+            actions, skill_text = model.infer_with_memory(
+                rng, observation, memory_text=memory_text,
+                tokenizer=tokenizer, generate_skill=True
+            )
+            if skill_text.endswith("<EOS_SKILL>"):
+                # Skill completed!
+                pass
+        """
+        action_rng, skill_rng = jax.random.split(rng)
+        observation = _model.preprocess_observation(None, observation, train=False)
+
+        # Tokenize memory text if provided
+        memory_tokens = None
+        memory_mask = None
+        if memory_text and tokenizer is not None:
+            # Tokenize the memory text
+            tokens, mask = tokenizer.tokenize(memory_text)
+            memory_tokens = jnp.array(tokens)[None, :]  # Add batch dimension
+            memory_mask = jnp.array(mask)[None, :]
+
+        # Embed prefix with optional memory
+        if memory_tokens is not None and memory_mask is not None:
+            prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix_with_memory(
+                observation, memory_tokens, memory_mask
+            )
+        else:
+            prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+
+        # ===== Action Generation (Flow Matching) =====
+        # Use the existing sample_actions logic but with memory-aware prefix
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        noise = jax.random.normal(action_rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # Fill KV cache with prefix (including memory)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        def step(carry):
+            x_t, time = carry
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix_action(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask_expanded = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask_expanded, suffix_attn_mask], axis=-1)
+
+            positions_suffix = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions_suffix,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+
+            assert prefix_out is None
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            x_t, time = carry
+            return time >= -dt / 2
+
+        actions, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+
+        # ===== Skill Generation (Optional) =====
+        skill_text = None
+        if generate_skill and tokenizer is not None:
+            # Generate skill text autoregressively from prefix
+            # For simplicity, we'll use the prefix hidden states to generate skill tokens
+            # This is a simplified version - in practice, you'd want full autoregressive sampling
+
+            # Get hidden states from prefix
+            prefix_hidden, _ = self.PaliGemma.llm(
+                [prefix_tokens, None],
+                mask=prefix_attn_mask,
+                positions=positions
+            )
+
+            # Use the last hidden state as context for skill generation
+            # TODO: Implement proper autoregressive generation with sampling
+            # For now, return a placeholder that indicates generation is needed
+            skill_text = "[SKILL_GENERATION_PLACEHOLDER]"
+            logger.warning(
+                "Skill generation is not fully implemented. "
+                "This requires autoregressive sampling from the PaliGemma expert."
+            )
+
+        return actions, skill_text
 
 
 # Factory function to create hierarchical config from standard Pi0 config

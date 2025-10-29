@@ -438,16 +438,40 @@ class LeRobotB1KHierarchicalDataConfig(DataConfigFactory):
     1. High-level skills (text, via language modeling)
     2. Low-level actions (continuous, via flow matching)
 
+    Training Phases:
+        Phase 0 (Sparse Prediction):
+            - enable_memory=False, use_dense_prediction=False
+            - Predict skills only at first N frames of each skill
+
+        Phase 1 (Long-Horizon Memory):
+            - enable_memory=True, use_dense_prediction=False
+            - Add ProVideLLM-style cache of past skills
+
+        Phase 3 (Dense Prediction with EOS):
+            - use_dense_prediction=True, use_eos_token=True, use_concise_format=True
+            - Predict concise skill JSON at EVERY frame
+            - Append <EOS_SKILL> token at skill boundaries
+            - Model learns skill boundaries through EOS detection
+
     Args:
         annotation_root: Path to skill annotation JSON files (task-XXXX/episode_XXXXXXXX.json)
         skill_prediction_window: Number of frames at skill start to predict skill text (default: 10)
+                                Only used when use_dense_prediction=False
         enable_memory: If True, add past skills memory for Phase 1 (ProVideLLM-style cache)
+        use_dense_prediction: If True, predict skill at EVERY frame (Phase 3)
+        use_eos_token: If True, append <EOS_SKILL> at end of skills (Phase 3)
+        use_concise_format: If True, use concise JSON format without object numbers (Phase 3)
+        use_hierarchical_tokenizer: If True, use HierarchicalTokenizer with special tokens (Phase 3)
         action_sequence_keys: Keys for action sequences in the dataset
     """
 
     annotation_root: str = str(DATASETS_BASE_DIR / "2025-challenge-demos/annotations")
     skill_prediction_window: int = 10
     enable_memory: bool = True  # Phase 0: False, Phase 1: True
+    use_dense_prediction: bool = False  # Phase 3: True
+    use_eos_token: bool = False  # Phase 3: True
+    use_concise_format: bool = False  # Phase 3: True
+    use_hierarchical_tokenizer: bool = False  # Phase 3: True
     action_sequence_keys: Sequence[str] = ("action",)
 
     @override
@@ -483,11 +507,17 @@ class LeRobotB1KHierarchicalDataConfig(DataConfigFactory):
             annotation_root=self.annotation_root,
             cache_annotations=True,
             skill_format="text",
-            skill_prediction_window=self.skill_prediction_window
+            skill_prediction_window=self.skill_prediction_window,
+            use_dense_prediction=self.use_dense_prediction,
+            use_eos_token=self.use_eos_token,
+            use_concise_format=self.use_concise_format
         )
 
         # Add skill tokenization transform (must come before model transforms)
-        skill_tokenize_transform = TokenizeSkills(max_len=64)
+        skill_tokenize_transform = TokenizeSkills(
+            max_len=64,
+            use_hierarchical_tokenizer=self.use_hierarchical_tokenizer
+        )
 
         # Optionally add memory transform for Phase 1
         if self.enable_memory:

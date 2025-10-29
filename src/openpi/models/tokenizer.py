@@ -5,10 +5,13 @@ import jax
 import numpy as np
 import orbax.checkpoint as ocp
 import sentencepiece
-from transformers import AutoProcessor
+from transformers import AutoProcessor, AutoTokenizer
 
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
+
+# Special token for skill end-of-sequence (Phase 3: Dense Prediction)
+EOS_SKILL_TOKEN = "<EOS_SKILL>"
 
 
 class PaligemmaTokenizer:
@@ -46,6 +49,104 @@ class PaligemmaTokenizer:
             mask = [True] * self._max_len
 
         return np.asarray(tokens), np.asarray(mask)
+
+
+class HierarchicalTokenizer:
+    """
+    Tokenizer for hierarchical VLA with support for special tokens like <EOS_SKILL>.
+
+    This tokenizer uses transformers AutoTokenizer to properly handle special tokens
+    that are needed for dense skill prediction with learned boundaries.
+
+    Args:
+        max_len: Maximum length for tokenization (default: 64)
+        add_eos_skill_token: Whether to add <EOS_SKILL> special token (default: True)
+    """
+
+    def __init__(self, max_len: int = 64, add_eos_skill_token: bool = True):
+        self._max_len = max_len
+
+        # Use transformers AutoTokenizer for better special token support
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "google/paligemma-3b-pt-224",
+            trust_remote_code=True
+        )
+
+        # Add special tokens if requested
+        if add_eos_skill_token:
+            special_tokens_to_add = {'additional_special_tokens': [EOS_SKILL_TOKEN]}
+            num_added = self.tokenizer.add_special_tokens(special_tokens_to_add)
+            logging.info(f"Added {num_added} special tokens to tokenizer: {EOS_SKILL_TOKEN}")
+
+            # Store the token ID for later use
+            self.eos_skill_token_id = self.tokenizer.convert_tokens_to_ids(EOS_SKILL_TOKEN)
+            logging.info(f"EOS_SKILL token ID: {self.eos_skill_token_id}")
+        else:
+            self.eos_skill_token_id = None
+
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Tokenize a text prompt into token IDs and attention mask.
+
+        Args:
+            prompt: Text prompt to tokenize
+            state: Optional state vector (for Pi05 format, not used in hierarchical VLA)
+
+        Returns:
+            (tokens, mask): Token IDs and attention mask arrays
+        """
+        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+
+        if state is not None:
+            # Pi05 format with state discretization
+            discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            state_str = " ".join(map(str, discretized_state))
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            encoded = self.tokenizer.encode(full_prompt, add_special_tokens=True)
+        else:
+            # Pi0 format - just encode the text
+            encoded = self.tokenizer.encode(cleaned_text, add_special_tokens=True)
+
+        tokens = encoded
+        tokens_len = len(tokens)
+
+        if tokens_len < self._max_len:
+            # Pad with zeros
+            padding = [0] * (self._max_len - tokens_len)
+            mask = [True] * tokens_len + [False] * len(padding)
+            tokens = tokens + padding
+        else:
+            if len(tokens) > self._max_len:
+                logging.warning(
+                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            mask = [True] * self._max_len
+
+        return np.asarray(tokens, dtype=np.int32), np.asarray(mask, dtype=np.bool_)
+
+    def decode(self, tokens: np.ndarray | list) -> str:
+        """
+        Decode token IDs back to text.
+
+        Args:
+            tokens: Token IDs to decode
+
+        Returns:
+            Decoded text string
+        """
+        if isinstance(tokens, np.ndarray):
+            tokens = tokens.tolist()
+
+        # Remove padding tokens (0s)
+        tokens = [t for t in tokens if t != 0]
+
+        return self.tokenizer.decode(tokens, skip_special_tokens=False)
+
+    def __len__(self) -> int:
+        """Return vocabulary size of the tokenizer."""
+        return len(self.tokenizer)
 
 
 class FASTTokenizer:

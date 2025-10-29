@@ -7,6 +7,7 @@ and convert them to format suitable for multi-task hierarchical training.
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -54,6 +55,83 @@ def get_skill_at_frame(
             return skill
 
     return None
+
+
+def _clean_object_id(obj_id_list: List[List[str]]) -> List[str]:
+    """
+    Remove trailing numbers from object IDs for concise representation.
+
+    This converts object IDs like "trash_can_123" to "trash_can" for
+    a more compact and generalizable skill representation.
+
+    Args:
+        obj_id_list: Nested list of object IDs from skill annotation
+
+    Returns:
+        List of cleaned object ID strings (without trailing numbers)
+
+    Example:
+        Input: [["radio_89", "coffee_table_koagbh_0"]]
+        Output: ["radio", "coffee_table_koagbh"]
+    """
+    if not obj_id_list or not obj_id_list[0]:
+        return []
+
+    cleaned_objects = []
+    for obj_id in obj_id_list[0]:
+        # Remove trailing underscore followed by numbers
+        cleaned_obj = re.sub(r'_\d+$', '', obj_id)
+        cleaned_objects.append(cleaned_obj)
+
+    return cleaned_objects
+
+
+def create_concise_skill_summary_json(skill_annotation: Dict[str, Any]) -> str:
+    """
+    Create a concise JSON string summary for dense skill prediction (Phase 3).
+
+    This creates an ultra-compact representation without trailing numbers in object IDs,
+    suitable for prediction at every frame. The format is more concise than skill_to_text()
+    to reduce token count during dense prediction.
+
+    Args:
+        skill_annotation: Skill annotation dictionary
+
+    Returns:
+        Concise JSON string without spaces
+
+    Example:
+        Input: {
+            "skill_description": ["move to"],
+            "object_id": [["trash_can_123"]],
+            "skill_type": ["navigation"]
+        }
+        Output: '{"skill":"move to","obj":"trash_can","type":"navigation"}'
+
+    Note:
+        - Only includes skill, obj (single primary object), and type
+        - Removes trailing numbers from object IDs (trash_can_123 -> trash_can)
+        - No manip, mem, spatial fields for maximum conciseness
+    """
+    summary_dict = {}
+
+    # Add skill description
+    if "skill_description" in skill_annotation and skill_annotation["skill_description"]:
+        summary_dict["skill"] = skill_annotation["skill_description"][0]
+
+    # Add primary object only (cleaned of trailing numbers)
+    if "object_id" in skill_annotation and skill_annotation["object_id"]:
+        cleaned_objs = _clean_object_id(skill_annotation["object_id"])
+        if cleaned_objs:
+            # Use only the first object for maximum conciseness
+            summary_dict["obj"] = cleaned_objs[0]
+
+    # Add skill type
+    if "skill_type" in skill_annotation and skill_annotation["skill_type"]:
+        summary_dict["type"] = skill_annotation["skill_type"][0]
+
+    # Convert to JSON string (compact, no whitespace)
+    return json.dumps(summary_dict, separators=(',', ':'))
 
 
 def skill_to_text(skill: Dict[str, Any]) -> str:
