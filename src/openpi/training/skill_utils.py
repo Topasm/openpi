@@ -313,8 +313,10 @@ def get_skill_prediction_info(
 
 # Example usage and testing
 if __name__ == "__main__":
-    # Example annotation path
-    annotation_path = Path("/home/seonghyeon/Postech-Behavior-Challenge/dataset/2025-challenge-demos/annotations/task-0000/episode_00000170.json")
+    # Example annotation path (uses DATASET_PATH environment variable)
+    import os
+    dataset_base = Path(os.getenv("DATASET_PATH", Path.cwd() / "dataset"))
+    annotation_path = dataset_base / "2025-challenge-demos/annotations/task-0000/episode_00000170.json"
 
     if annotation_path.exists():
         # Load annotation

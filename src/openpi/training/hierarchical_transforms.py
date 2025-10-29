@@ -619,8 +619,11 @@ class TokenizeDynamicMemory:
 
 # Example usage
 if __name__ == "__main__":
-    # Test the transform with example data
-    annotation_root = "/home/seonghyeon/Postech-Behavior-Challenge/dataset/2025-challenge-demos/annotations"
+    # Test the transform with example data (uses DATASET_PATH environment variable)
+    import os
+    from pathlib import Path
+    dataset_base = Path(os.getenv("DATASET_PATH", Path.cwd() / "dataset"))
+    annotation_root = str(dataset_base / "2025-challenge-demos/annotations")
 
     # Create transform
     transform = AddSkillAnnotation(annotation_root)

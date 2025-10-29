@@ -12,22 +12,8 @@ test_*.py
 
 # Documentation drafts (keep only committed docs)
 CLAUDE.md
-MOE_README.md
-MOE_TRAINING_GUIDE.md
-MOVEMENT_SEGMENTATION_README.md
-MoE_IMPLEMENTATION_SUMMARY.md
-MoE_TRAINING_PIPELINE_FIXES.md
-ONLINE_MOVEMENT_LABELING_COMPLETE.md
-PI0_B1K_MOE_CONFIG.md
-docs/moe_*.md
-docs/movement_*.md
 
-# Example/test scripts (not part of main codebase)
-examples/moe_*.py
-scripts/test_*.py
-scripts/train_moe.py
-src/openpi/training/movement_segmentation.py
-src/openpi/training/movement_aware_dataset.py
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

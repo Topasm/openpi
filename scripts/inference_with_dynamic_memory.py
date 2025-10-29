@@ -23,6 +23,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -268,13 +269,13 @@ def main():
     parser.add_argument(
         "--annotation_root",
         type=Path,
-        default="/home/seonghyeon/Postech-Behavior-Challenge/dataset/2025-challenge-demos/annotations",
+        default=Path(os.getenv("DATASET_PATH", Path.cwd() / "dataset")) / "2025-challenge-demos/annotations",
         help="Root directory of skill annotations"
     )
     parser.add_argument(
         "--data_root",
         type=Path,
-        default="/home/seonghyeon/Postech-Behavior-Challenge/dataset/2025-challenge-demos",
+        default=Path(os.getenv("DATASET_PATH", Path.cwd() / "dataset")) / "2025-challenge-demos",
         help="Root directory of dataset"
     )
     parser.add_argument(

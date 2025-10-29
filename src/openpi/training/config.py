@@ -445,7 +445,7 @@ class LeRobotB1KHierarchicalDataConfig(DataConfigFactory):
         action_sequence_keys: Keys for action sequences in the dataset
     """
 
-    annotation_root: str = "/data3/BEHAVIOR-1K/2025-challenge-demos/annotations"
+    annotation_root: str = str(DATASETS_BASE_DIR / "2025-challenge-demos/annotations")
     skill_prediction_window: int = 10
     enable_memory: bool = True  # Phase 0: False, Phase 1: True
     action_sequence_keys: Sequence[str] = ("action",)
@@ -538,7 +538,7 @@ class LeRobotB1KDynamicMemoryDataConfig(DataConfigFactory):
         action_sequence_keys: Keys for action sequences in the dataset
     """
 
-    annotation_root: str = "/data3/BEHAVIOR-1K/2025-challenge-demos/annotations"
+    annotation_root: str = str(DATASETS_BASE_DIR / "2025-challenge-demos/annotations")
     skill_prediction_window: int = 10
     max_short_term_frames: int = 10
     action_sequence_keys: Sequence[str] = ("action",)
@@ -996,7 +996,7 @@ _CONFIGS = [
                 episodes_index=list(range(190)),
                 behavior_dataset_root=DATASETS_BASE_DIR / "2025-challenge-demos",
             ),
-            annotation_root="/home/seonghyeon/Postech-Behavior-Challenge/dataset/2025-challenge-demos/annotations",
+            annotation_root=str(DATASETS_BASE_DIR / "2025-challenge-demos/annotations"),
             skill_prediction_window=10,  # Predict skill at first 10 frames of each skill
             enable_memory=False,  # Phase 0: False, Phase 1: True
         ),
@@ -1038,7 +1038,7 @@ _CONFIGS = [
                 episodes_index=list(range(190)),
                 behavior_dataset_root=DATASETS_BASE_DIR / "2025-challenge-demos",
             ),
-            annotation_root="/home/seonghyeon/Postech-Behavior-Challenge/dataset/2025-challenge-demos/annotations",
+            annotation_root=str(DATASETS_BASE_DIR / "2025-challenge-demos/annotations"),
             skill_prediction_window=10,
             max_short_term_frames=10,  # Maximum visual frames in short-term memory
         ),
