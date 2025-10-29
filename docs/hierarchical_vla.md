@@ -159,15 +159,6 @@ Compressed text instead of frames:
 - Semantic: Captures "what was done" not "how it looked"
 - Long-term: Remembers 10-15 skills vs 3-5 frames
 
-## Note on MoE Files
-
-The codebase contains MoE (Mixture of Experts) related files that are NOT used by the hierarchical VLA implementation. These can be ignored:
-- `src/openpi/models/pi0_moe.py` - Not used
-- `src/openpi/models/moe.py` - Not used
-- `src/openpi/models/gemma_moe.py` - Not used
-- Configs: `pi0_b1k_moe`, `pi0_b1k_dual_head` - Different approach
-
-The hierarchical VLA uses skill prediction (language modeling), not expert routing.
 
 ## Related Files
 
