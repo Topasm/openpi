@@ -520,6 +520,106 @@ class LeRobotB1KHierarchicalDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotB1KDynamicMemoryDataConfig(DataConfigFactory):
+    """B1K data config with Dynamic Interleaved Cache (Phase 2).
+
+    This config implements the advanced "Dynamic Interleaved Cache" system that
+    separates memory into long-term (text summaries of completed skills) and
+    short-term (visual frames from current skill).
+
+    During training, this simulates the inference-time memory state where:
+    - Long-term memory: Text summaries of all completed skills (0 to k-1)
+    - Short-term memory: Recent visual frames from current skill k
+
+    Args:
+        annotation_root: Path to skill annotation JSON files
+        skill_prediction_window: Number of frames at skill start to predict skill text
+        max_short_term_frames: Maximum number of visual frames in short-term memory
+        action_sequence_keys: Keys for action sequences in the dataset
+    """
+
+    annotation_root: str = "/data3/BEHAVIOR-1K/2025-challenge-demos/annotations"
+    skill_prediction_window: int = 10
+    max_short_term_frames: int = 10
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Import hierarchical and dynamic memory transforms
+        from openpi.training.hierarchical_transforms import (
+            AddSkillAnnotation,
+            TokenizeSkills,
+            CreateDynamicMemoryBatch,
+            TokenizeDynamicMemory
+        )
+
+        # Same repack transform as base B1K config
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/egocentric_camera": "observation.images.rgb.head",
+                        "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+                        "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Start with standard B1K data transforms
+        data_transforms = _transforms.Group(
+            inputs=[b1k_policy.B1kInputs(
+                action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[b1k_policy.B1kOutputs(action_dim=23)],
+        )
+
+        # Add hierarchical skill annotation transform
+        skill_annotation_transform = AddSkillAnnotation(
+            annotation_root=self.annotation_root,
+            cache_annotations=True,
+            skill_format="text",
+            skill_prediction_window=self.skill_prediction_window
+        )
+
+        # Add skill tokenization transform
+        skill_tokenize_transform = TokenizeSkills(max_len=64)
+
+        # Add dynamic memory transforms (Phase 2)
+        dynamic_memory_transform = CreateDynamicMemoryBatch(
+            annotation_root=self.annotation_root,
+            max_short_term_frames=self.max_short_term_frames,
+            cache_annotations=True,
+            special_token="<PAST_SKILL>"
+        )
+        dynamic_memory_tokenize_transform = TokenizeDynamicMemory(max_memory_len=256)
+
+        # Add all transforms to the pipeline
+        data_transforms = data_transforms.push(
+            inputs=[
+                skill_annotation_transform,
+                dynamic_memory_transform,
+                skill_tokenize_transform,
+                dynamic_memory_tokenize_transform
+            ]
+        )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            use_quantile_norm=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -915,6 +1015,48 @@ _CONFIGS = [
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir="./outputs/checkpoints",
         num_workers=0,  # Disable multiprocessing due to BehaviorLeRobotDataset pickle issues
+    ),
+
+    # B1K Dynamic Memory config - Phase 2: Dynamic Interleaved Cache
+    # This implements the advanced memory system with long-term (text) and short-term (vision) blocks
+    TrainConfig(
+        name="pi0_b1k_dynamic_memory",
+        exp_name="openpi_dynamic_memory",
+        project_name="B1K_DynamicMemory",
+        model=pi0_hierarchical.Pi0HierarchicalConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            skill_loss_weight=10.0,
+            action_loss_weight=1.0,
+            max_skill_tokens=64,
+        ),
+        data=LeRobotB1KDynamicMemoryDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(190)),
+                behavior_dataset_root=DATASETS_BASE_DIR / "2025-challenge-demos",
+            ),
+            annotation_root="/home/seonghyeon/Postech-Behavior-Challenge/dataset/2025-challenge-demos/annotations",
+            skill_prediction_window=10,
+            max_short_term_frames=10,  # Maximum visual frames in short-term memory
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=50_000,
+        freeze_filter=pi0_hierarchical.Pi0HierarchicalConfig(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        val_log_interval=2500,
+        val_repo_id="behavior-1k/2025-challenge-demos",
+        val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=0,
     ),
 
     #

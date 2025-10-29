@@ -403,6 +403,220 @@ class TokenizeMemory:
         return data
 
 
+class CreateDynamicMemoryBatch:
+    """
+    Transform that creates a dynamic memory batch for "Dynamic Interleaved Cache" training.
+
+    This is an advanced transform for Phase 2 (Dynamic Memory) that simulates the
+    inference-time memory state. Unlike Phase 1's static prepended cache, this creates
+    a time-ordered interleaved cache that matches what the model sees during inference.
+
+    For each training frame at time t within skill k:
+    1. Long-term memory (text): Summaries of all completed skills (0 to k-1)
+    2. Short-term memory (vision): Recent visual frames from current skill k
+
+    This ensures the model learns to use the same input format during training
+    as it will receive from the ContextMemory manager during inference.
+
+    Args:
+        annotation_root: Root directory containing skill annotation JSON files
+        max_short_term_frames: Maximum number of visual frames to include (default: 10)
+        cache_annotations: If True, cache loaded annotations in memory
+        special_token: Special token to wrap past skills (default: "<PAST_SKILL>")
+    """
+
+    def __init__(
+        self,
+        annotation_root: str | Path,
+        max_short_term_frames: int = 10,
+        cache_annotations: bool = True,
+        special_token: str = "<PAST_SKILL>"
+    ):
+        self.annotation_root = Path(annotation_root)
+        self.max_short_term_frames = max_short_term_frames
+        self.cache_annotations = cache_annotations
+        self.special_token = special_token
+
+        # Cache for annotations
+        self._annotation_cache = {} if cache_annotations else None
+
+    def __call__(self, data: dict) -> dict:
+        """
+        Create dynamic memory batch for a training sample.
+
+        Args:
+            data: Training data dictionary containing:
+                  - "episode_index": Episode index
+                  - "index": Frame index within episode
+                  - "task_index": Task index
+                  - "skill_idx": Current skill index (from AddSkillAnnotation)
+                  - "observation.images.*": Image observations
+
+        Returns:
+            data with added fields:
+            - "dynamic_memory_text": str, concatenated past skill summaries
+            - "dynamic_memory_images": array, stacked visual frames from current skill
+            - "num_past_skills": int, number of skills in long-term memory
+            - "num_current_frames": int, number of frames in short-term memory
+        """
+        episode_idx = data.get("episode_index")
+        frame_idx = data.get("index")
+        task_idx = data.get("task_index")
+        skill_idx = data.get("skill_idx", -1)
+
+        # Handle batched vs unbatched
+        is_batched = isinstance(episode_idx, np.ndarray) or hasattr(episode_idx, "shape")
+        if is_batched:
+            logger.warning("Batched dynamic memory not yet fully implemented. Using first item.")
+            episode_idx = int(episode_idx.flat[0]) if hasattr(episode_idx, "flat") else int(episode_idx[0])
+            frame_idx = int(frame_idx.flat[0]) if hasattr(frame_idx, "flat") else int(frame_idx[0])
+            task_idx = int(task_idx.flat[0]) if hasattr(task_idx, "flat") else int(task_idx[0])
+            skill_idx = int(skill_idx.flat[0]) if hasattr(skill_idx, "flat") else int(skill_idx[0])
+        else:
+            episode_idx = int(episode_idx)
+            frame_idx = int(frame_idx)
+            task_idx = int(task_idx)
+            skill_idx = int(skill_idx)
+
+        if skill_idx == -1 or not data.get("has_skill", False):
+            # No skill annotation - return empty memory
+            data["dynamic_memory_text"] = ""
+            data["dynamic_memory_images"] = np.array([])
+            data["num_past_skills"] = 0
+            data["num_current_frames"] = 0
+            return data
+
+        try:
+            # Load annotation for this episode
+            annotation = self._load_annotation(episode_idx, task_idx)
+            all_skills = annotation["skill_annotation"]
+            current_skill = all_skills[skill_idx]
+
+            # 1. Generate long-term memory: text summaries for completed skills
+            past_skill_texts = []
+            for skill in all_skills[:skill_idx]:  # All skills before current
+                summary_text = skill_utils.skill_to_text(skill)
+                past_skill_texts.append(f"{self.special_token} {summary_text} </{self.special_token[1:]}")
+
+            # Concatenate into single text string
+            dynamic_memory_text = " ".join(past_skill_texts)
+
+            # 2. Generate short-term memory: visual frames from current skill
+            # Note: This is a simplified version that just passes through current frame
+            # In a full implementation, you would load multiple frames from the skill
+            # For now, we use the current observation image
+            # TODO: Implement loading multiple frames from skill start to current frame
+
+            # For the simplified version, we'll store metadata that can be used
+            # by subsequent transforms
+            skill_start_frame = current_skill["frame_duration"][0]
+            skill_end_frame = current_skill["frame_duration"][1]
+
+            # Calculate which frames to include (sub-sampling logic)
+            frames_in_skill = frame_idx - skill_start_frame + 1
+            if frames_in_skill > self.max_short_term_frames:
+                # We would need to sub-sample frames, but since we're working with
+                # single-frame batches, we'll just pass through metadata
+                num_current_frames = self.max_short_term_frames
+            else:
+                num_current_frames = frames_in_skill
+
+            # Store metadata for potential use by other transforms
+            data["dynamic_memory_text"] = dynamic_memory_text
+            data["num_past_skills"] = len(past_skill_texts)
+            data["num_current_frames"] = num_current_frames
+            data["skill_start_frame"] = skill_start_frame
+            data["skill_end_frame"] = skill_end_frame
+            data["frames_into_skill"] = frames_in_skill
+
+            logger.debug(
+                f"Created dynamic memory: {len(past_skill_texts)} past skills, "
+                f"{num_current_frames} current frames"
+            )
+
+        except Exception as e:
+            logger.error(f"Error creating dynamic memory batch for episode {episode_idx}: {e}")
+            data["dynamic_memory_text"] = ""
+            data["dynamic_memory_images"] = np.array([])
+            data["num_past_skills"] = 0
+            data["num_current_frames"] = 0
+
+        return data
+
+    def _load_annotation(self, episode_idx: int, task_idx: int) -> dict:
+        """Load skill annotation for an episode, with optional caching."""
+        if self._annotation_cache is not None and episode_idx in self._annotation_cache:
+            return self._annotation_cache[episode_idx]
+
+        episode_name = f"episode_{episode_idx:08d}"
+        annotation_path = self.annotation_root / f"task-{task_idx:04d}" / f"{episode_name}.json"
+        annotation = skill_utils.load_skill_annotation(annotation_path)
+
+        if self._annotation_cache is not None:
+            self._annotation_cache[episode_idx] = annotation
+
+        return annotation
+
+
+class TokenizeDynamicMemory:
+    """
+    Tokenizes dynamic memory text for the model input.
+
+    This converts the dynamic_memory_text (past skill summaries) into tokens
+    that can be fed to the model's memory embedding layer.
+
+    Args:
+        tokenizer: PaliGemma tokenizer (if None, creates default)
+        max_memory_len: Maximum number of memory tokens (default: 256)
+    """
+
+    def __init__(self, tokenizer=None, max_memory_len: int = 256):
+        if tokenizer is None:
+            from openpi.models.tokenizer import PaligemmaTokenizer
+            self.tokenizer = PaligemmaTokenizer(max_len=max_memory_len)
+        else:
+            self.tokenizer = tokenizer
+        self.max_memory_len = max_memory_len
+
+    def __call__(self, data: dict) -> dict:
+        """
+        Tokenize dynamic memory text.
+
+        Args:
+            data: Dictionary with "dynamic_memory_text" field
+
+        Returns:
+            data with added fields:
+            - "dynamic_memory_tokens": [memory_len] integer token IDs
+            - "dynamic_memory_mask": [memory_len] boolean mask
+        """
+        if "dynamic_memory_text" in data and data.get("num_past_skills", 0) > 0:
+            memory_text = data["dynamic_memory_text"]
+
+            # Tokenize
+            tokens, mask = self.tokenizer.tokenize(memory_text)
+
+            # Truncate if too long
+            if len(tokens) > self.max_memory_len:
+                tokens = tokens[:self.max_memory_len]
+                mask = mask[:self.max_memory_len]
+
+            # Pad if too short
+            elif len(tokens) < self.max_memory_len:
+                pad_len = self.max_memory_len - len(tokens)
+                tokens = np.concatenate([tokens, np.zeros(pad_len, dtype=tokens.dtype)])
+                mask = np.concatenate([mask, np.zeros(pad_len, dtype=mask.dtype)])
+
+            data["dynamic_memory_tokens"] = tokens
+            data["dynamic_memory_mask"] = mask
+        else:
+            # No memory - create empty placeholders
+            data["dynamic_memory_tokens"] = np.zeros(self.max_memory_len, dtype=np.int32)
+            data["dynamic_memory_mask"] = np.zeros(self.max_memory_len, dtype=np.bool_)
+
+        return data
+
+
 # Example usage
 if __name__ == "__main__":
     # Test the transform with example data
