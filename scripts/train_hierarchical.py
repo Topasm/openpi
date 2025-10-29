@@ -170,9 +170,14 @@ def train_step(
         skill_tokens = batch_dict.get("skill_tokens", None)
         skill_mask = batch_dict.get("skill_mask", None)
 
-        # MODIFIED: Extract memory tokens (Phase 1)
+        # MODIFIED: Extract memory tokens (Phase 1: static, Phase 2: dynamic)
         memory_tokens = batch_dict.get("memory_tokens", None)
         memory_mask = batch_dict.get("memory_mask", None)
+
+        # Phase 2: Dynamic memory tokens (if available, use these instead)
+        dynamic_memory_tokens = batch_dict.get("dynamic_memory_tokens", None)
+        dynamic_memory_mask = batch_dict.get("dynamic_memory_mask", None)
+        use_dynamic_memory = dynamic_memory_tokens is not None and dynamic_memory_mask is not None
 
         # MODIFIED: Pass skill + memory data to compute_loss
         # For hierarchical model, compute_loss returns (loss, loss_dict)
@@ -185,6 +190,9 @@ def train_step(
             skill_mask=skill_mask,
             memory_tokens=memory_tokens,
             memory_mask=memory_mask,
+            dynamic_memory_tokens=dynamic_memory_tokens,
+            dynamic_memory_mask=dynamic_memory_mask,
+            use_dynamic_memory=use_dynamic_memory,
             train=True
         )
 

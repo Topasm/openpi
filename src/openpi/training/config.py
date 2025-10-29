@@ -447,7 +447,7 @@ class LeRobotB1KHierarchicalDataConfig(DataConfigFactory):
 
     annotation_root: str = "/data3/BEHAVIOR-1K/2025-challenge-demos/annotations"
     skill_prediction_window: int = 10
-    enable_memory: bool = False  # Phase 0: False, Phase 1: True
+    enable_memory: bool = True  # Phase 0: False, Phase 1: True
     action_sequence_keys: Sequence[str] = ("action",)
 
     @override
