@@ -1049,7 +1049,7 @@ _CONFIGS = [
             skill_prediction_window=10,  # Predict skill at first 10 frames of each skill
             enable_memory=False,  # Phase 0: False, Phase 1: True
         ),
-        weight_loader=weight_loaders.HierarchicalWeightLoader(
+        weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=50_000,
         freeze_filter=pi0_hierarchical.Pi0HierarchicalConfig(

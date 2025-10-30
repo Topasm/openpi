@@ -392,11 +392,13 @@ class Pi0Hierarchical(_model.BaseModel):
         positions = jnp.cumsum(input_mask, axis=1) - 1
 
         # Run through LLM
+        # Only use AdaRMS conditioning if pi05 is enabled
+        # When pi05=False, the conditioning is already added to action_expert_tokens (line 306)
         (prefix_out, action_suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, action_suffix_tokens],
             mask=attn_mask,
             positions=positions,
-            adarms_cond=[None, adarms_cond]
+            adarms_cond=[None, adarms_cond if self.pi05 else None]
         )
 
         # Compute action loss
@@ -417,7 +419,9 @@ class Pi0Hierarchical(_model.BaseModel):
             prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
 
             # Run only prefix through PaliGemma expert
-            (prefix_hidden,), _ = self.PaliGemma.llm(
+            # LLM returns a list with two elements [paligemma_output, action_expert_output]
+            # Since we pass [prefix_tokens, None], action_expert_output will be None
+            (prefix_hidden, _), _ = self.PaliGemma.llm(
                 [prefix_tokens, None],
                 mask=prefix_attn_mask,
                 positions=prefix_positions,
