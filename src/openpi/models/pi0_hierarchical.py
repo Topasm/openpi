@@ -326,14 +326,11 @@ class Pi0Hierarchical(_model.BaseModel):
         skill_mask: Optional[at.Bool[at.Array, "b skill_len"]] = None,
         memory_tokens: Optional[at.Int[at.Array, "b memory_len"]] = None,
         memory_mask: Optional[at.Bool[at.Array, "b memory_len"]] = None,
-        dynamic_memory_tokens: Optional[at.Int[at.Array, "b memory_len"]] = None,
-        dynamic_memory_mask: Optional[at.Bool[at.Array, "b memory_len"]] = None,
-        use_dynamic_memory: bool = False,
         *,
         train: bool = False
     ) -> tuple[at.Float[at.Array, ""], dict]:
         """
-        Compute hierarchical multi-task loss with optional memory (Phase 1/Phase 2).
+        Compute hierarchical multi-task loss with optional memory (Phases 0/1/3).
 
         Args:
             rng: Random key
@@ -341,11 +338,8 @@ class Pi0Hierarchical(_model.BaseModel):
             actions: Ground truth actions [B, action_horizon, action_dim]
             skill_tokens: Ground truth skill tokens [B, skill_len] (optional)
             skill_mask: Mask for skill tokens [B, skill_len] (optional)
-            memory_tokens: Past skills memory tokens [B, memory_len] (optional, Phase 1)
-            memory_mask: Mask for memory tokens [B, memory_len] (optional, Phase 1)
-            dynamic_memory_tokens: Dynamic memory tokens [B, memory_len] (optional, Phase 2)
-            dynamic_memory_mask: Dynamic memory mask [B, memory_len] (optional, Phase 2)
-            use_dynamic_memory: If True, use dynamic memory instead of static memory
+            memory_tokens: Past skills memory tokens [B, memory_len] (optional, Phase 1/3)
+            memory_mask: Mask for memory tokens [B, memory_len] (optional, Phase 1/3)
             train: Whether in training mode
 
         Returns:
@@ -367,14 +361,9 @@ class Pi0Hierarchical(_model.BaseModel):
         u_t = noise - actions
 
         # Forward pass: prefix (with optional memory) + action suffix
-        # Choose memory mode: Phase 0 (no memory), Phase 1 (static), or Phase 2 (dynamic)
-        if use_dynamic_memory and dynamic_memory_tokens is not None and dynamic_memory_mask is not None:
-            # Phase 2: Dynamic interleaved memory
-            prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix_with_memory(
-                observation, dynamic_memory_tokens, dynamic_memory_mask
-            )
-        elif memory_tokens is not None and memory_mask is not None:
-            # Phase 1: Static prepended memory
+        # Phase 0 (no memory) vs Phase 1/3 (with memory)
+        if memory_tokens is not None and memory_mask is not None:
+            # Phase 1/3: With past skills memory
             prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix_with_memory(
                 observation, memory_tokens, memory_mask
             )

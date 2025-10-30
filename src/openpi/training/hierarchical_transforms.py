@@ -75,20 +75,24 @@ class AddSkillAnnotation:
         self.use_concise_format = use_concise_format
 
         if skill_format not in ["text", "dict"]:
-            raise ValueError(f"skill_format must be 'text' or 'dict', got {skill_format}")
+            raise ValueError(
+                f"skill_format must be 'text' or 'dict', got {skill_format}")
 
         # Cache for annotations: episode_index -> annotation_data
         self._annotation_cache = {} if cache_annotations else None
 
         # Log configuration
         if use_dense_prediction:
-            logger.info("Phase 3 Mode: Dense prediction enabled (predict at every frame)")
+            logger.info(
+                "Phase 3 Mode: Dense prediction enabled (predict at every frame)")
             if use_eos_token:
-                logger.info(f"  EOS token enabled: appending '{EOS_SKILL_TOKEN}' at end of skills")
+                logger.info(
+                    f"  EOS token enabled: appending '{EOS_SKILL_TOKEN}' at end of skills")
             if use_concise_format:
                 logger.info("  Using concise JSON format (no object numbers)")
         else:
-            logger.info(f"Phase 0/1 Mode: Sparse prediction (window size: {skill_prediction_window} frames)")
+            logger.info(
+                f"Phase 0/1 Mode: Sparse prediction (window size: {skill_prediction_window} frames)")
 
     def __call__(self, data: dict) -> dict:
         """
@@ -98,7 +102,7 @@ class AddSkillAnnotation:
             data: Training data dictionary containing at minimum:
                   - "episode_index": int or array with episode index
                   - "index": int or array with frame index within episode
-                  - "task_index": int or array with task index
+                  - "task_index": (optional) int or array with task index
 
         Returns:
             data: Same dictionary with added fields:
@@ -115,28 +119,42 @@ class AddSkillAnnotation:
         frame_idx = data.get("index")  # Frame index within the episode
         task_idx = data.get("task_index")
 
-        if episode_idx is None or frame_idx is None or task_idx is None:
-            logger.warning("Missing episode_index, index, or task_index in data. Skipping skill annotation.")
+        # If episode_index is missing, we can't proceed
+        if episode_idx is None or frame_idx is None:
+            logger.warning(
+                f"Missing episode_index or index in data. Skipping skill annotation.")
             data["has_skill"] = False
             data["skill_text"] = ""
             data["skill_dict"] = {}
             data["skill_idx"] = -1
             return data
 
-        # Handle batched vs unbatched data
-        is_batched = isinstance(episode_idx, np.ndarray) or hasattr(episode_idx, "shape")
+        # Helper function to extract scalar value from various types (numpy, torch, scalar)
+        def to_int(value):
+            """Convert numpy array, torch tensor, or scalar to int."""
+            if hasattr(value, "item"):  # Works for both numpy and torch
+                return int(value.item())
+            elif hasattr(value, "flat"):  # Numpy array
+                return int(value.flat[0])
+            elif hasattr(value, "__getitem__") and not isinstance(value, (int, float)):  # Array-like
+                return int(value[0])
+            else:
+                return int(value)
 
-        if is_batched:
-            # TODO: For batched data, we need to process each item in the batch
-            # For now, we'll handle the simple case of single samples
-            logger.warning("Batched skill annotation not yet implemented. Using first item only.")
-            episode_idx = int(episode_idx.flat[0]) if hasattr(episode_idx, "flat") else int(episode_idx[0])
-            frame_idx = int(frame_idx.flat[0]) if hasattr(frame_idx, "flat") else int(frame_idx[0])
-            task_idx = int(task_idx.flat[0]) if hasattr(task_idx, "flat") else int(task_idx[0])
-        else:
-            episode_idx = int(episode_idx)
-            frame_idx = int(frame_idx)
-            task_idx = int(task_idx)
+        # Extract task_index from episode_index if not provided
+        # Episode format: episode_TTTTIIIT where TTTT = task index (first 4 digits)
+        if task_idx is None:
+            ep_val = to_int(episode_idx)
+            # Extract first 4 digits: episode_00001234 -> 0000
+            task_idx = ep_val // 10000  # Integer division to get first 4 digits
+            logger.debug(
+                f"Derived task_index={task_idx} from episode_index={ep_val}")
+
+        # Convert all values to int scalars
+        episode_idx = to_int(episode_idx)
+        frame_idx = to_int(frame_idx)
+        if task_idx is not None:
+            task_idx = to_int(task_idx)
 
         # Load annotation for this episode
         try:
@@ -150,7 +168,8 @@ class AddSkillAnnotation:
 
             if skill is None:
                 # Frame is in a gap between skills (should be rare)
-                logger.debug(f"No skill found for episode {episode_idx}, frame {frame_idx}")
+                logger.debug(
+                    f"No skill found for episode {episode_idx}, frame {frame_idx}")
                 data["has_skill"] = False
                 data["predict_skill"] = False
                 data["skill_text"] = ""
@@ -174,7 +193,8 @@ class AddSkillAnnotation:
                 # Generate skill text
                 if self.use_concise_format:
                     # Phase 3: Use concise JSON format without object numbers
-                    skill_text = skill_utils.create_concise_skill_summary_json(skill)
+                    skill_text = skill_utils.create_concise_skill_summary_json(
+                        skill)
                 else:
                     # Phase 0/1: Use full format
                     skill_text = skill_utils.skill_to_text(skill)
@@ -186,22 +206,26 @@ class AddSkillAnnotation:
                 # Append EOS token if enabled and at last frame
                 if self.use_eos_token and is_last_frame:
                     skill_text = f"{skill_text} {EOS_SKILL_TOKEN}"
-                    logger.debug(f"Appended EOS token at frame {frame_idx} (skill end)")
+                    logger.debug(
+                        f"Appended EOS token at frame {frame_idx} (skill end)")
 
                 data["skill_text"] = skill_text
                 data["skill_dict"] = skill_utils.skill_to_dict(skill)
                 data["skill_idx"] = skill["skill_idx"]
-                data["is_skill_end_frame"] = is_last_frame  # Metadata for debugging
+                # Metadata for debugging
+                data["is_skill_end_frame"] = is_last_frame
 
         except FileNotFoundError as e:
-            logger.warning(f"Annotation not found for episode {episode_idx}: {e}")
+            logger.warning(
+                f"Annotation not found for episode {episode_idx}: {e}")
             data["has_skill"] = False
             data["predict_skill"] = False
             data["skill_text"] = ""
             data["skill_dict"] = {}
             data["skill_idx"] = -1
         except Exception as e:
-            logger.error(f"Error loading skill annotation for episode {episode_idx}: {e}")
+            logger.error(
+                f"Error loading skill annotation for episode {episode_idx}: {e}")
             data["has_skill"] = False
             data["predict_skill"] = False
             data["skill_text"] = ""
@@ -227,7 +251,8 @@ class AddSkillAnnotation:
 
         # Construct path: annotation_root/task-TTTT/episode_EEEEEEEE.json
         episode_name = f"episode_{episode_idx:08d}"
-        annotation_path = self.annotation_root / f"task-{task_idx:04d}" / f"{episode_name}.json"
+        annotation_path = self.annotation_root / \
+            f"task-{task_idx:04d}" / f"{episode_name}.json"
 
         # Load annotation
         annotation = skill_utils.load_skill_annotation(annotation_path)
@@ -287,21 +312,34 @@ class AddPastSkillsCache:
         skill_idx = data.get("skill_idx", -1)
         task_idx = data.get("task_index")
 
-        if episode_idx is None or skill_idx == -1 or task_idx is None:
+        if episode_idx is None or skill_idx == -1:
             data["past_skills_cache"] = []
             data["num_past_skills"] = 0
             return data
 
-        # Handle batched vs unbatched
-        is_batched = isinstance(episode_idx, np.ndarray) or hasattr(episode_idx, "shape")
-        if is_batched:
-            episode_idx = int(episode_idx.flat[0]) if hasattr(episode_idx, "flat") else int(episode_idx[0])
-            skill_idx = int(skill_idx.flat[0]) if hasattr(skill_idx, "flat") else int(skill_idx[0])
-            task_idx = int(task_idx.flat[0]) if hasattr(task_idx, "flat") else int(task_idx[0])
-        else:
-            episode_idx = int(episode_idx)
-            skill_idx = int(skill_idx)
-            task_idx = int(task_idx)
+        # Helper function to extract scalar value from various types (numpy, torch, scalar)
+        def to_int(value):
+            """Convert numpy array, torch tensor, or scalar to int."""
+            if hasattr(value, "item"):  # Works for both numpy and torch
+                return int(value.item())
+            elif hasattr(value, "flat"):  # Numpy array
+                return int(value.flat[0])
+            elif hasattr(value, "__getitem__") and not isinstance(value, (int, float)):  # Array-like
+                return int(value[0])
+            else:
+                return int(value)
+
+        # Convert to scalar integers
+        episode_idx = to_int(episode_idx)
+        skill_idx = to_int(skill_idx)
+        if task_idx is not None:
+            task_idx = to_int(task_idx)
+
+        # Extract task_index from episode_index if not provided
+        if task_idx is None:
+            task_idx = episode_idx // 10000
+            logger.debug(
+                f"Derived task_index={task_idx} from episode_index={episode_idx}")
 
         try:
             annotation = self._load_annotation(episode_idx, task_idx)
@@ -313,7 +351,8 @@ class AddPastSkillsCache:
 
             if self.format_with_tokens:
                 past_skills = [
-                    skill_utils.format_skill_with_special_tokens(skill, self.special_token)
+                    skill_utils.format_skill_with_special_tokens(
+                        skill, self.special_token)
                     for skill in past_skills
                 ]
 
@@ -321,7 +360,8 @@ class AddPastSkillsCache:
             data["num_past_skills"] = len(past_skills)
 
         except Exception as e:
-            logger.error(f"Error creating past skills cache for episode {episode_idx}: {e}")
+            logger.error(
+                f"Error creating past skills cache for episode {episode_idx}: {e}")
             data["past_skills_cache"] = []
             data["num_past_skills"] = 0
 
@@ -333,7 +373,8 @@ class AddPastSkillsCache:
             return self._annotation_cache[episode_idx]
 
         episode_name = f"episode_{episode_idx:08d}"
-        annotation_path = self.annotation_root / f"task-{task_idx:04d}" / f"{episode_name}.json"
+        annotation_path = self.annotation_root / \
+            f"task-{task_idx:04d}" / f"{episode_name}.json"
         annotation = skill_utils.load_skill_annotation(annotation_path)
 
         if self._annotation_cache is not None:
@@ -360,8 +401,10 @@ class TokenizeSkills:
             if use_hierarchical_tokenizer:
                 # Phase 3: Use HierarchicalTokenizer with special token support
                 from openpi.models.tokenizer import HierarchicalTokenizer
-                self.tokenizer = HierarchicalTokenizer(max_len=max_len, add_eos_skill_token=True)
-                logger.info("Using HierarchicalTokenizer with <EOS_SKILL> token support")
+                self.tokenizer = HierarchicalTokenizer(
+                    max_len=max_len, add_eos_skill_token=True)
+                logger.info(
+                    "Using HierarchicalTokenizer with <EOS_SKILL> token support")
             else:
                 # Phase 0/1: Use standard PaligemmaTokenizer
                 from openpi.models.tokenizer import PaligemmaTokenizer
@@ -454,15 +497,18 @@ class TokenizeMemory:
             elif len(tokens) < self.max_memory_len:
                 import numpy as np
                 pad_len = self.max_memory_len - len(tokens)
-                tokens = np.concatenate([tokens, np.zeros(pad_len, dtype=tokens.dtype)])
-                mask = np.concatenate([mask, np.zeros(pad_len, dtype=mask.dtype)])
+                tokens = np.concatenate(
+                    [tokens, np.zeros(pad_len, dtype=tokens.dtype)])
+                mask = np.concatenate(
+                    [mask, np.zeros(pad_len, dtype=mask.dtype)])
 
             data["memory_tokens"] = tokens
             data["memory_mask"] = mask
         else:
             # No memory - create empty placeholders
             import numpy as np
-            data["memory_tokens"] = np.zeros(self.max_memory_len, dtype=np.int32)
+            data["memory_tokens"] = np.zeros(
+                self.max_memory_len, dtype=np.int32)
             data["memory_mask"] = np.zeros(self.max_memory_len, dtype=np.bool_)
 
         return data
@@ -529,19 +575,33 @@ class CreateDynamicMemoryBatch:
         task_idx = data.get("task_index")
         skill_idx = data.get("skill_idx", -1)
 
-        # Handle batched vs unbatched
-        is_batched = isinstance(episode_idx, np.ndarray) or hasattr(episode_idx, "shape")
-        if is_batched:
-            logger.warning("Batched dynamic memory not yet fully implemented. Using first item.")
-            episode_idx = int(episode_idx.flat[0]) if hasattr(episode_idx, "flat") else int(episode_idx[0])
-            frame_idx = int(frame_idx.flat[0]) if hasattr(frame_idx, "flat") else int(frame_idx[0])
-            task_idx = int(task_idx.flat[0]) if hasattr(task_idx, "flat") else int(task_idx[0])
-            skill_idx = int(skill_idx.flat[0]) if hasattr(skill_idx, "flat") else int(skill_idx[0])
-        else:
-            episode_idx = int(episode_idx)
-            frame_idx = int(frame_idx)
-            task_idx = int(task_idx)
-            skill_idx = int(skill_idx)
+        # Helper function to extract scalar value from various types (numpy, torch, scalar)
+        def to_int(value):
+            """Convert numpy array, torch tensor, or scalar to int."""
+            if hasattr(value, "item"):  # Works for both numpy and torch
+                return int(value.item())
+            elif hasattr(value, "flat"):  # Numpy array
+                return int(value.flat[0])
+            elif hasattr(value, "__getitem__") and not isinstance(value, (int, float)):  # Array-like
+                return int(value[0])
+            else:
+                return int(value)
+
+        # Convert to scalar integers
+        if episode_idx is not None:
+            episode_idx = to_int(episode_idx)
+        if frame_idx is not None:
+            frame_idx = to_int(frame_idx)
+        if task_idx is not None:
+            task_idx = to_int(task_idx)
+        if skill_idx != -1:
+            skill_idx = to_int(skill_idx)
+
+        # Extract task_index from episode_index if not provided
+        if task_idx is None:
+            task_idx = episode_idx // 10000
+            logger.debug(
+                f"Derived task_index={task_idx} from episode_index={episode_idx}")
 
         if skill_idx == -1 or not data.get("has_skill", False):
             # No skill annotation - return empty memory
@@ -561,7 +621,8 @@ class CreateDynamicMemoryBatch:
             past_skill_texts = []
             for skill in all_skills[:skill_idx]:  # All skills before current
                 summary_text = skill_utils.skill_to_text(skill)
-                past_skill_texts.append(f"{self.special_token} {summary_text} </{self.special_token[1:]}")
+                past_skill_texts.append(
+                    f"{self.special_token} {summary_text} </{self.special_token[1:]}")
 
             # Concatenate into single text string
             dynamic_memory_text = " ".join(past_skill_texts)
@@ -600,7 +661,8 @@ class CreateDynamicMemoryBatch:
             )
 
         except Exception as e:
-            logger.error(f"Error creating dynamic memory batch for episode {episode_idx}: {e}")
+            logger.error(
+                f"Error creating dynamic memory batch for episode {episode_idx}: {e}")
             data["dynamic_memory_text"] = ""
             data["dynamic_memory_images"] = np.array([])
             data["num_past_skills"] = 0
@@ -614,7 +676,8 @@ class CreateDynamicMemoryBatch:
             return self._annotation_cache[episode_idx]
 
         episode_name = f"episode_{episode_idx:08d}"
-        annotation_path = self.annotation_root / f"task-{task_idx:04d}" / f"{episode_name}.json"
+        annotation_path = self.annotation_root / \
+            f"task-{task_idx:04d}" / f"{episode_name}.json"
         annotation = skill_utils.load_skill_annotation(annotation_path)
 
         if self._annotation_cache is not None:
@@ -669,15 +732,19 @@ class TokenizeDynamicMemory:
             # Pad if too short
             elif len(tokens) < self.max_memory_len:
                 pad_len = self.max_memory_len - len(tokens)
-                tokens = np.concatenate([tokens, np.zeros(pad_len, dtype=tokens.dtype)])
-                mask = np.concatenate([mask, np.zeros(pad_len, dtype=mask.dtype)])
+                tokens = np.concatenate(
+                    [tokens, np.zeros(pad_len, dtype=tokens.dtype)])
+                mask = np.concatenate(
+                    [mask, np.zeros(pad_len, dtype=mask.dtype)])
 
             data["dynamic_memory_tokens"] = tokens
             data["dynamic_memory_mask"] = mask
         else:
             # No memory - create empty placeholders
-            data["dynamic_memory_tokens"] = np.zeros(self.max_memory_len, dtype=np.int32)
-            data["dynamic_memory_mask"] = np.zeros(self.max_memory_len, dtype=np.bool_)
+            data["dynamic_memory_tokens"] = np.zeros(
+                self.max_memory_len, dtype=np.int32)
+            data["dynamic_memory_mask"] = np.zeros(
+                self.max_memory_len, dtype=np.bool_)
 
         return data
 

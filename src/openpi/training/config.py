@@ -432,47 +432,44 @@ class LeRobotB1KDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotB1KHierarchicalDataConfig(DataConfigFactory):
-    """B1K data config with hierarchical skill annotations for multi-task training.
+    """B1K data config with unified hierarchical skill annotations for multi-task training.
 
-    This config adds skill annotation transforms to enable the model to predict both:
-    1. High-level skills (text, via language modeling)
+    This config enables the model to predict both:
+    1. High-level skills (text, via language modeling) - Dense prediction at every frame
     2. Low-level actions (continuous, via flow matching)
 
-    Training Phases:
-        Phase 0 (Sparse Prediction):
-            - enable_memory=False, use_dense_prediction=False
-            - Predict skills only at first N frames of each skill
+    Unified Training Approach:
+        - Dense Prediction: Predict skills at EVERY frame (not just first N frames)
+        - EOS Boundary Detection: Model learns when skills end via <EOS_SKILL> tokens
+        - Memory Integration: Past skills compressed as text tokens for long-horizon context
+        - Concise Format: Use simplified JSON format for efficient token usage
 
-        Phase 1 (Long-Horizon Memory):
-            - enable_memory=True, use_dense_prediction=False
-            - Add ProVideLLM-style cache of past skills
-
-        Phase 3 (Dense Prediction with EOS):
-            - use_dense_prediction=True, use_eos_token=True, use_concise_format=True
-            - Predict concise skill JSON at EVERY frame
-            - Append <EOS_SKILL> token at skill boundaries
-            - Model learns skill boundaries through EOS detection
+    Key Features:
+        • Dense skill prediction at all frames enables better skill-action alignment
+        • EOS tokens teach the model to detect skill boundaries autonomously
+        • Memory allows handling episodes longer than context window
+        • Unified approach eliminates need for multi-phase training
 
     Args:
         annotation_root: Path to skill annotation JSON files (task-XXXX/episode_XXXXXXXX.json)
-        skill_prediction_window: Number of frames at skill start to predict skill text (default: 10)
-                                Only used when use_dense_prediction=False
-        enable_memory: If True, add past skills memory for Phase 1 (ProVideLLM-style cache)
-        use_dense_prediction: If True, predict skill at EVERY frame (Phase 3)
-        use_eos_token: If True, append <EOS_SKILL> at end of skills (Phase 3)
-        use_concise_format: If True, use concise JSON format without object numbers (Phase 3)
-        use_hierarchical_tokenizer: If True, use HierarchicalTokenizer with special tokens (Phase 3)
+        skill_prediction_window: Legacy parameter (not used in unified model)
+        enable_memory: Always True - memory used when available in data
+        use_dense_prediction: Always True - predict skills at every frame
+        use_eos_token: Always True - append <EOS_SKILL> at skill boundaries
+        use_concise_format: Always True - use concise JSON format
+        use_hierarchical_tokenizer: Always True - use HierarchicalTokenizer with special tokens
         action_sequence_keys: Keys for action sequences in the dataset
     """
 
     annotation_root: str = str(
         DATASETS_BASE_DIR / "2025-challenge-demos/annotations")
+    # Not used in unified model (always dense)
     skill_prediction_window: int = 10
-    enable_memory: bool = True  # Phase 0: False, Phase 1: True
-    use_dense_prediction: bool = False  # Phase 3: True
-    use_eos_token: bool = False  # Phase 3: True
-    use_concise_format: bool = False  # Phase 3: True
-    use_hierarchical_tokenizer: bool = False  # Phase 3: True
+    enable_memory: bool = True  # Always enabled - memory used when available
+    use_dense_prediction: bool = True  # Always predict skills at every frame
+    use_eos_token: bool = True  # Always use EOS tokens for boundary detection
+    use_concise_format: bool = True  # Use concise JSON format
+    use_hierarchical_tokenizer: bool = True  # HuggingFace auth is configured
     action_sequence_keys: Sequence[str] = ("action",)
 
     @override
@@ -481,6 +478,7 @@ class LeRobotB1KHierarchicalDataConfig(DataConfigFactory):
         from openpi.training.hierarchical_transforms import AddSkillAnnotation, TokenizeSkills, AddPastSkillsCache, TokenizeMemory
 
         # Same repack transform as base B1K config
+        # IMPORTANT: Must include episode_index and index for hierarchical transforms
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
@@ -491,6 +489,8 @@ class LeRobotB1KHierarchicalDataConfig(DataConfigFactory):
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
+                        "episode_index": "episode_index",  # Preserve for skill annotation
+                        "index": "index",  # Preserve for skill annotation
                     }
                 )
             ]
@@ -598,6 +598,7 @@ class LeRobotB1KDynamicMemoryDataConfig(DataConfigFactory):
         )
 
         # Same repack transform as base B1K config
+        # IMPORTANT: Must include episode_index and index for hierarchical transforms
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
@@ -608,6 +609,8 @@ class LeRobotB1KDynamicMemoryDataConfig(DataConfigFactory):
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
+                        "episode_index": "episode_index",  # Preserve for skill annotation
+                        "index": "index",  # Preserve for skill annotation
                     }
                 )
             ]
@@ -631,23 +634,11 @@ class LeRobotB1KDynamicMemoryDataConfig(DataConfigFactory):
         # Add skill tokenization transform
         skill_tokenize_transform = TokenizeSkills(max_len=64)
 
-        # Add dynamic memory transforms (Phase 2)
-        dynamic_memory_transform = CreateDynamicMemoryBatch(
-            annotation_root=self.annotation_root,
-            max_short_term_frames=self.max_short_term_frames,
-            cache_annotations=True,
-            special_token="<PAST_SKILL>"
-        )
-        dynamic_memory_tokenize_transform = TokenizeDynamicMemory(
-            max_memory_len=256)
-
         # Add all transforms to the pipeline
         data_transforms = data_transforms.push(
             inputs=[
                 skill_annotation_transform,
-                dynamic_memory_transform,
-                skill_tokenize_transform,
-                dynamic_memory_tokenize_transform
+                skill_tokenize_transform
             ]
         )
 
@@ -1023,17 +1014,17 @@ _CONFIGS = [
     ),
 
     # B1K Hierarchical VLA config - Multi-task learning with skill + action prediction
-    # Phase 0: Skill prediction at task boundaries (no memory)
-    # Phase 1: Long-horizon memory with ProVideLLM-style cache
+    # Unified Hierarchical VLA: Dense prediction + Memory + EOS tokens
+    # Combines best of all phases: dense skill prediction, memory for long horizon, EOS for boundaries
     TrainConfig(
         name="pi0_b1k_hierarchical",
-        exp_name="openpi_hierarchical",
-        project_name="B1K_Hierarchical",
+        exp_name="openpi_hierarchical_unified",
+        project_name="B1K_Hierarchical_Unified",
         model=pi0_hierarchical.Pi0HierarchicalConfig(
             action_horizon=50,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
-            skill_loss_weight=10.0,  # Higher weight to compensate for fewer skill samples
+            skill_loss_weight=10.0,
             action_loss_weight=1.0,
             max_skill_tokens=64,
         ),
@@ -1046,8 +1037,7 @@ _CONFIGS = [
             ),
             annotation_root=str(DATASETS_BASE_DIR /
                                 "2025-challenge-demos/annotations"),
-            skill_prediction_window=10,  # Predict skill at first 10 frames of each skill
-            enable_memory=False,  # Phase 0: False, Phase 1: True
+            # Unified settings: dense + memory + EOS (defaults are already set in class)
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_base/params"),
@@ -1064,49 +1054,6 @@ _CONFIGS = [
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir="./outputs/checkpoints",
         num_workers=0,  # Disable multiprocessing due to BehaviorLeRobotDataset pickle issues
-    ),
-
-    # B1K Dynamic Memory config - Phase 2: Dynamic Interleaved Cache
-    # This implements the advanced memory system with long-term (text) and short-term (vision) blocks
-    TrainConfig(
-        name="pi0_b1k_dynamic_memory",
-        exp_name="openpi_dynamic_memory",
-        project_name="B1K_DynamicMemory",
-        model=pi0_hierarchical.Pi0HierarchicalConfig(
-            action_horizon=50,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-            skill_loss_weight=10.0,
-            action_loss_weight=1.0,
-            max_skill_tokens=64,
-        ),
-        data=LeRobotB1KDynamicMemoryDataConfig(
-            repo_id="behavior-1k/2025-challenge-demos",
-            base_config=DataConfig(
-                prompt_from_task=True,
-                episodes_index=list(range(190)),
-                behavior_dataset_root=DATASETS_BASE_DIR / "2025-challenge-demos",
-            ),
-            annotation_root=str(DATASETS_BASE_DIR /
-                                "2025-challenge-demos/annotations"),
-            skill_prediction_window=10,
-            max_short_term_frames=10,  # Maximum visual frames in short-term memory
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=50_000,
-        freeze_filter=pi0_hierarchical.Pi0HierarchicalConfig(
-            action_horizon=50,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        val_log_interval=2500,
-        val_repo_id="behavior-1k/2025-challenge-demos",
-        val_episodes_index=list(range(190, 200)),
-        assets_base_dir="./outputs/assets",
-        checkpoint_base_dir="./outputs/checkpoints",
-        num_workers=0,
     ),
 
     #
