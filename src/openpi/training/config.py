@@ -465,7 +465,8 @@ class LeRobotB1KHierarchicalDataConfig(DataConfigFactory):
         action_sequence_keys: Keys for action sequences in the dataset
     """
 
-    annotation_root: str = str(DATASETS_BASE_DIR / "2025-challenge-demos/annotations")
+    annotation_root: str = str(
+        DATASETS_BASE_DIR / "2025-challenge-demos/annotations")
     skill_prediction_window: int = 10
     enable_memory: bool = True  # Phase 0: False, Phase 1: True
     use_dense_prediction: bool = False  # Phase 3: True
@@ -495,14 +496,8 @@ class LeRobotB1KHierarchicalDataConfig(DataConfigFactory):
             ]
         )
 
-        # Start with standard B1K data transforms
-        data_transforms = _transforms.Group(
-            inputs=[b1k_policy.B1kInputs(
-                action_dim=model_config.action_dim, model_type=model_config.model_type)],
-            outputs=[b1k_policy.B1kOutputs(action_dim=23)],
-        )
-
-        # Add hierarchical skill annotation transform
+        # Add hierarchical skill annotation transform FIRST (before B1kInputs)
+        # This must come first because it needs episode_index, index, task_index from raw data
         skill_annotation_transform = AddSkillAnnotation(
             annotation_root=self.annotation_root,
             cache_annotations=True,
@@ -513,13 +508,14 @@ class LeRobotB1KHierarchicalDataConfig(DataConfigFactory):
             use_concise_format=self.use_concise_format
         )
 
-        # Add skill tokenization transform (must come before model transforms)
+        # Add skill tokenization transform
         skill_tokenize_transform = TokenizeSkills(
             max_len=64,
             use_hierarchical_tokenizer=self.use_hierarchical_tokenizer
         )
 
-        # Optionally add memory transform for Phase 1
+        # Start with skill transforms, then standard B1K data transforms
+        # Order matters: skill annotation needs raw data with episode_index, etc.
         if self.enable_memory:
             memory_transform = AddPastSkillsCache(
                 annotation_root=self.annotation_root,
@@ -528,19 +524,36 @@ class LeRobotB1KHierarchicalDataConfig(DataConfigFactory):
                 special_token="<L>"
             )
             memory_tokenize_transform = TokenizeMemory(max_memory_len=256)
-            data_transforms = data_transforms.push(
-                inputs=[skill_annotation_transform, memory_transform, skill_tokenize_transform, memory_tokenize_transform]
+            data_transforms = _transforms.Group(
+                inputs=[
+                    skill_annotation_transform,
+                    memory_transform,
+                    skill_tokenize_transform,
+                    memory_tokenize_transform,
+                    b1k_policy.B1kInputs(
+                        action_dim=model_config.action_dim, model_type=model_config.model_type)
+                ],
+                outputs=[b1k_policy.B1kOutputs(action_dim=23)],
             )
         else:
-            data_transforms = data_transforms.push(
-                inputs=[skill_annotation_transform, skill_tokenize_transform]
+            data_transforms = _transforms.Group(
+                inputs=[
+                    skill_annotation_transform,
+                    skill_tokenize_transform,
+                    b1k_policy.B1kInputs(
+                        action_dim=model_config.action_dim, model_type=model_config.model_type)
+                ],
+                outputs=[b1k_policy.B1kOutputs(action_dim=23)],
             )
 
         # Model transforms include things like tokenizing the prompt and action targets
         model_transforms = ModelTransformFactory()(model_config)
 
+        # Create base config (which includes behavior_dataset_root from self.base_config)
+        base_data_config = self.create_base_config(assets_dirs, model_config)
+
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_data_config,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -568,7 +581,8 @@ class LeRobotB1KDynamicMemoryDataConfig(DataConfigFactory):
         action_sequence_keys: Keys for action sequences in the dataset
     """
 
-    annotation_root: str = str(DATASETS_BASE_DIR / "2025-challenge-demos/annotations")
+    annotation_root: str = str(
+        DATASETS_BASE_DIR / "2025-challenge-demos/annotations")
     skill_prediction_window: int = 10
     max_short_term_frames: int = 10
     action_sequence_keys: Sequence[str] = ("action",)
@@ -624,7 +638,8 @@ class LeRobotB1KDynamicMemoryDataConfig(DataConfigFactory):
             cache_annotations=True,
             special_token="<PAST_SKILL>"
         )
-        dynamic_memory_tokenize_transform = TokenizeDynamicMemory(max_memory_len=256)
+        dynamic_memory_tokenize_transform = TokenizeDynamicMemory(
+            max_memory_len=256)
 
         # Add all transforms to the pipeline
         data_transforms = data_transforms.push(
@@ -639,8 +654,11 @@ class LeRobotB1KDynamicMemoryDataConfig(DataConfigFactory):
         # Model transforms include things like tokenizing the prompt and action targets
         model_transforms = ModelTransformFactory()(model_config)
 
+        # Create base config (which includes behavior_dataset_root from self.base_config)
+        base_data_config = self.create_base_config(assets_dirs, model_config)
+
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_data_config,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -1026,11 +1044,12 @@ _CONFIGS = [
                 episodes_index=list(range(190)),
                 behavior_dataset_root=DATASETS_BASE_DIR / "2025-challenge-demos",
             ),
-            annotation_root=str(DATASETS_BASE_DIR / "2025-challenge-demos/annotations"),
+            annotation_root=str(DATASETS_BASE_DIR /
+                                "2025-challenge-demos/annotations"),
             skill_prediction_window=10,  # Predict skill at first 10 frames of each skill
             enable_memory=False,  # Phase 0: False, Phase 1: True
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
+        weight_loader=weight_loaders.HierarchicalWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=50_000,
         freeze_filter=pi0_hierarchical.Pi0HierarchicalConfig(
@@ -1068,7 +1087,8 @@ _CONFIGS = [
                 episodes_index=list(range(190)),
                 behavior_dataset_root=DATASETS_BASE_DIR / "2025-challenge-demos",
             ),
-            annotation_root=str(DATASETS_BASE_DIR / "2025-challenge-demos/annotations"),
+            annotation_root=str(DATASETS_BASE_DIR /
+                                "2025-challenge-demos/annotations"),
             skill_prediction_window=10,
             max_short_term_frames=10,  # Maximum visual frames in short-term memory
         ),

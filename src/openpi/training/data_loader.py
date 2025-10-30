@@ -23,20 +23,24 @@ class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
-        raise NotImplementedError("Subclasses of Dataset should implement __getitem__.")
+        raise NotImplementedError(
+            "Subclasses of Dataset should implement __getitem__.")
 
     def __len__(self) -> int:
-        raise NotImplementedError("Subclasses of Dataset should implement __len__.")
+        raise NotImplementedError(
+            "Subclasses of Dataset should implement __len__.")
 
 
 class IterableDataset(Protocol[T_co]):
     """Interface for an iterable dataset."""
 
     def __iter__(self) -> Iterator[T_co]:
-        raise NotImplementedError("Subclasses of IterableDataset should implement __iter__.")
+        raise NotImplementedError(
+            "Subclasses of IterableDataset should implement __iter__.")
 
     def __len__(self) -> int:
-        raise NotImplementedError("Subclasses of Dataset should implement __len__.")
+        raise NotImplementedError(
+            "Subclasses of Dataset should implement __len__.")
 
 
 class DataLoader(Protocol[T_co]):
@@ -44,10 +48,12 @@ class DataLoader(Protocol[T_co]):
 
     def data_config(self) -> _config.DataConfig:
         """Get the data config for this data loader."""
-        raise NotImplementedError("Subclasses of DataLoader should implement data_config.")
+        raise NotImplementedError(
+            "Subclasses of DataLoader should implement data_config.")
 
     def __iter__(self) -> Iterator[T_co]:
-        raise NotImplementedError("Subclasses of DataLoader should implement __iter__.")
+        raise NotImplementedError(
+            "Subclasses of DataLoader should implement __iter__.")
 
 
 class TransformedDataset(Dataset[T_co]):
@@ -146,7 +152,8 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset.meta.tasks)])
+        dataset = TransformedDataset(
+            dataset, [_transforms.PromptFromLeRobotTask(dataset.meta.tasks)])
 
     return dataset
 
@@ -161,9 +168,13 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # Use behavior_dataset_root if available, otherwise use default cache
+    root = data_config.behavior_dataset_root if data_config.behavior_dataset_root else None
+
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=root,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
@@ -171,7 +182,8 @@ def create_torch_dataset(
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        dataset = TransformedDataset(
+            dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
 
@@ -210,7 +222,8 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            _transforms.Normalize(
+                norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
     )
@@ -238,7 +251,8 @@ def transform_iterable_dataset(
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            _transforms.Normalize(
+                norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
         is_batched=is_batched,
@@ -302,8 +316,10 @@ def create_behavior_data_loader(
     skip_norm_stats: bool = False,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     data_config = config.data.create(config.assets_dirs, config.model)
-    dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    dataset = create_behavior_dataset(
+        data_config, action_horizon=config.model.action_horizon)
+    dataset = transform_dataset(
+        dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     data_loader = TorchDataLoader(
         dataset,
@@ -314,7 +330,7 @@ def create_behavior_data_loader(
         num_workers=config.num_workers,
         seed=config.seed,
     )
-    
+
     return DataLoaderImpl(data_config, data_loader)
 
 
@@ -349,8 +365,14 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    # Use BehaviorLeRobotDataset for B1K data, otherwise use standard LeRobotDataset
+    if data_config.behavior_dataset_root is not None:
+        dataset = create_behavior_dataset(data_config, action_horizon)
+    else:
+        dataset = create_torch_dataset(
+            data_config, action_horizon, model_config)
+    dataset = transform_dataset(
+        dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
@@ -376,7 +398,8 @@ def create_torch_data_loader(
         dataset,
         local_batch_size=local_batch_size,
         sharding=None if framework == "pytorch" else sharding,
-        shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
+        # Don't shuffle if using sampler
+        shuffle=(sampler is None and shuffle),
         sampler=sampler,
         num_batches=num_batches,
         num_workers=num_workers,
@@ -415,9 +438,12 @@ def create_rlds_data_loader(
             If not provided, will iterate over the dataset indefinitely.
     """
     if framework == "pytorch":
-        raise NotImplementedError("PyTorch RLDS data loader is not supported yet")
-    dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle)
-    dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
+        raise NotImplementedError(
+            "PyTorch RLDS data loader is not supported yet")
+    dataset = create_rlds_dataset(
+        data_config, action_horizon, batch_size, shuffle=shuffle)
+    dataset = transform_iterable_dataset(
+        dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
 
     data_loader = RLDSDataLoader(
         dataset,
@@ -460,10 +486,12 @@ class TorchDataLoader:
             seed: The seed to use for shuffling the data.
         """
         if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
+            raise NotImplementedError(
+                "Data loading with multiple processes is not supported.")
 
         if len(dataset) < local_batch_size:
-            raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
+            raise ValueError(
+                f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
@@ -484,7 +512,8 @@ class TorchDataLoader:
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
             batch_size=local_batch_size,
-            shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
+            # Don't shuffle if using sampler
+            shuffle=(sampler is None and shuffle),
             sampler=sampler,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
@@ -509,7 +538,8 @@ class TorchDataLoader:
                 try:
                     batch = next(data_iter)
                 except StopIteration:
-                    break  # We've exhausted the dataset. Create a new iterator and start over.
+                    # We've exhausted the dataset. Create a new iterator and start over.
+                    break
                 num_items += 1
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
@@ -550,7 +580,8 @@ class RLDSDataLoader:
         self._num_batches = num_batches
 
         if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
+            raise NotImplementedError(
+                "Data loading with multiple processes is not supported.")
 
         if sharding is None:
             # Use data parallel sharding by default.
@@ -572,7 +603,8 @@ class RLDSDataLoader:
                 try:
                     batch = next(data_iter)
                 except StopIteration:
-                    break  # We've exhausted the dataset. Create a new iterator and start over.
+                    # We've exhausted the dataset. Create a new iterator and start over.
+                    break
                 num_items += 1
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
 

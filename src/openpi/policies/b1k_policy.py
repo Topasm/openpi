@@ -24,12 +24,18 @@ def extract_state_from_proprio(proprio_data):
     We assume perfect correlation for the two gripper fingers.
     """
     # extract joint position
-    base_qvel = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["base_qvel"]]  # 3
-    trunk_qpos = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["trunk_qpos"]]  # 4
-    arm_left_qpos = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["arm_left_qpos"]]  #  7
-    arm_right_qpos = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["arm_right_qpos"]]  #  7
-    left_gripper_width = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["gripper_left_qpos"]].sum(axis=-1, keepdims=True)  # 1
-    right_gripper_width = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["gripper_right_qpos"]].sum(axis=-1, keepdims=True)  # 1
+    base_qvel = proprio_data[...,
+                             PROPRIOCEPTION_INDICES["R1Pro"]["base_qvel"]]  # 3
+    trunk_qpos = proprio_data[...,
+                              PROPRIOCEPTION_INDICES["R1Pro"]["trunk_qpos"]]  # 4
+    arm_left_qpos = proprio_data[...,
+                                 PROPRIOCEPTION_INDICES["R1Pro"]["arm_left_qpos"]]  # 7
+    arm_right_qpos = proprio_data[...,
+                                  PROPRIOCEPTION_INDICES["R1Pro"]["arm_right_qpos"]]  # 7
+    left_gripper_width = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["gripper_left_qpos"]].sum(
+        axis=-1, keepdims=True)  # 1
+    right_gripper_width = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["gripper_right_qpos"]].sum(
+        axis=-1, keepdims=True)  # 1
     return np.concatenate([
         base_qvel,
         trunk_qpos,
@@ -63,7 +69,7 @@ class B1kInputs(transforms.DataTransformFn):
         # extract joint position
         state = extract_state_from_proprio(proprio_data)
         if "actions" in data:
-            action =  data["actions"]
+            action = data["actions"]
 
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
         # stores as float32 (C,H,W), gets skipped for policy inference
@@ -96,12 +102,21 @@ class B1kInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Preserve skill-related fields added by hierarchical transforms
+        # These fields need to pass through for hierarchical training
+        skill_fields = ["skill", "has_skill", "skill_tokens", "skill_mask",
+                        "memory_skills", "memory_mask"]
+        for field in skill_fields:
+            if field in data:
+                inputs[field] = data[field]
+
         return inputs
 
 
 @dataclasses.dataclass(frozen=True)
 class B1kOutputs(transforms.DataTransformFn):
     action_dim: int = 23
+
     def __call__(self, data: dict) -> dict:
         # Only return the first 23 dims.
         return {"actions": np.asarray(data["actions"][:, :self.action_dim])}

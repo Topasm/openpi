@@ -108,6 +108,35 @@ class AuxLossWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen=True)
+class HierarchicalWeightLoader(WeightLoader):
+    """Loads weights for Pi0Hierarchical model from a standard Pi0 checkpoint.
+
+    This loader:
+    1. Loads the base Pi0 weights (PaliGemma + action_out_proj + LoRA if present)
+    2. Initializes AdaRMS Dense layer parameters randomly (for action expert conditioning)
+    3. Initializes any new hierarchical-specific parameters (time_mlp, etc.)
+
+    Note: The action expert uses AdaRMS (adaptive RMSNorm) which requires Dense layers
+    in the normalization modules. These parameters don't exist in the base checkpoint
+    and need to be randomly initialized.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        # Load checkpoint
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+
+        # Initialize randomly:
+        # - LoRA weights (standard)
+        # - AdaRMS Dense layers (pre_attention_norm_1/Dense_0, pre_ffw_norm_1/Dense_0)
+        # - Time MLP layers (time_mlp_in, time_mlp_out, action_time_mlp_in, action_time_mlp_out)
+        missing_regex = ".*(lora|Dense_0|time_mlp).*"
+
+        return _merge_params(loaded_params, params, missing_regex=missing_regex)
+
+
+@dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
     """Loads weights from the official PaliGemma checkpoint.
 
