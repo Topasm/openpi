@@ -430,7 +430,10 @@ class Pi0Hierarchical(_model.BaseModel):
 
             # Project hidden states to vocabulary using Gemma's embedder.decode()
             # This converts [B, seq_len, hidden_dim] -> [B, seq_len, vocab_size]
-            vocab_logits = self.PaliGemma.llm.embedder.decode(prefix_hidden)
+            # The embedder is wrapped in ToNNX, so we manually perform the decode operation
+            # decode(x) = dot(x, embedding_table.T)
+            embedding_table = self.PaliGemma.llm.embedder['input_embedding']
+            vocab_logits = jnp.dot(prefix_hidden, embedding_table.value.T)
             # Shape: [B, prefix_len, vocab_size=257152]
 
             # Extract logits for skill tokens

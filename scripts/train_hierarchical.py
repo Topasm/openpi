@@ -380,14 +380,20 @@ def main(config: _config.TrainConfig):
 
             # Format log string with hierarchical losses if available
             if "skill_loss" in reduced_info and "action_loss" in reduced_info:
+                # Use 'loss' if available, otherwise use 'total_loss'
+                total_loss_val = float(reduced_info.get('loss', reduced_info.get('total_loss', 0.0)))
                 info_str = (
-                    f"total={reduced_info['loss']:.4f}, "
-                    f"skill={reduced_info['skill_loss']:.4f}, "
-                    f"action={reduced_info['action_loss']:.4f}, "
-                    f"grad_norm={reduced_info['grad_norm']:.4f}"
+                    f"total={total_loss_val:.4f}, "
+                    f"skill={float(reduced_info['skill_loss']):.4f}, "
+                    f"action={float(reduced_info['action_loss']):.4f}, "
+                    f"grad_norm={float(reduced_info['grad_norm']):.4f}"
                 )
             else:
-                info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                # Format only numeric values
+                info_str = ", ".join(
+                    f"{k}={float(v):.4f}" for k, v in reduced_info.items()
+                    if isinstance(v, (int, float, jnp.ndarray))
+                )
 
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
