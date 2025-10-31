@@ -6,6 +6,7 @@ from typing import Any
 import jax.numpy as jnp
 
 import openpi.models.model as _model
+import openpi.models.tokenizer as _tokenizer
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
@@ -89,6 +90,20 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    # Create tokenizer for hierarchical models
+    tokenizer = None
+    if hasattr(model, "infer_with_memory"):
+        # This is a hierarchical model - create HierarchicalTokenizer
+        try:
+            tokenizer = _tokenizer.HierarchicalTokenizer(
+                max_len=64,  # Match max_skill_tokens in model config
+                add_eos_skill_token=True
+            )
+            logging.info("Created HierarchicalTokenizer for skill generation")
+        except Exception as e:
+            logging.warning(f"Failed to create HierarchicalTokenizer: {e}")
+            logging.warning("Skill generation will not be available")
+
     return _policy.Policy(
         model,
         transforms=[
@@ -108,4 +123,5 @@ def create_trained_policy(
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
+        tokenizer=tokenizer,
     )

@@ -299,11 +299,14 @@ class Pi0Hierarchical(_model.BaseModel):
             adarms_cond = nnx.gelu(self.time_mlp_in(time_emb))
             adarms_cond = self.time_mlp_out(adarms_cond)
         else:
+            # For non-pi05 models, embed time+state and add directly to tokens
             state_emb = self.state_proj(observation.state)
             time_state_emb = jnp.concatenate([time_emb, state_emb], axis=-1)
-            adarms_cond = nnx.gelu(self.action_time_mlp_in(time_state_emb))
-            adarms_cond = self.action_time_mlp_out(adarms_cond)
-            action_expert_tokens = action_expert_tokens + adarms_cond[:, None, :]
+            time_cond = nnx.gelu(self.action_time_mlp_in(time_state_emb))
+            time_cond = self.action_time_mlp_out(time_cond)
+            action_expert_tokens = action_expert_tokens + time_cond[:, None, :]
+            # Set adarms_cond to None for non-pi05 models
+            adarms_cond = None
 
         # Add positional embeddings for each action token
         positions = jnp.arange(self.action_horizon)
@@ -639,25 +642,95 @@ class Pi0Hierarchical(_model.BaseModel):
         # ===== Skill Generation (Optional) =====
         skill_text = None
         if generate_skill and tokenizer is not None:
-            # Generate skill text autoregressively from prefix
-            # For simplicity, we'll use the prefix hidden states to generate skill tokens
-            # This is a simplified version - in practice, you'd want full autoregressive sampling
-
-            # Get hidden states from prefix
-            prefix_hidden, _ = self.PaliGemma.llm(
+            # Generate skill text autoregressively using the VQ head
+            # Start with BOS token and sample until EOS or max length
+            
+            # Get embedding table for decoding logits -> tokens
+            embedding_table = self.PaliGemma.llm.embedder['input_embedding']
+            
+            # Initialize with empty skill (will be filled autoregressively)
+            batch_size = observation.state.shape[0]
+            generated_tokens = []
+            
+            # Use prefix hidden states as context
+            prefix_attn_mask_gen = make_attn_mask(prefix_mask, prefix_ar_mask)
+            positions_gen = jnp.cumsum(prefix_mask, axis=1) - 1
+            (prefix_hidden, _), kv_cache_skill = self.PaliGemma.llm(
                 [prefix_tokens, None],
-                mask=prefix_attn_mask,
-                positions=positions
+                mask=prefix_attn_mask_gen,
+                positions=positions_gen
             )
 
-            # Use the last hidden state as context for skill generation
-            # TODO: Implement proper autoregressive generation with sampling
-            # For now, return a placeholder that indicates generation is needed
-            skill_text = "[SKILL_GENERATION_PLACEHOLDER]"
-            logger.warning(
-                "Skill generation is not fully implemented. "
-                "This requires autoregressive sampling from the PaliGemma expert."
-            )
+            # Track the current KV cache size (starts with prefix length)
+            current_cache_len = jnp.sum(prefix_mask, axis=-1)[0]  # Scalar: total prefix tokens
+
+            # Autoregressively generate skill tokens
+            for step_idx in range(max_skill_length):
+                # Project last hidden state to vocabulary
+                # vocab_logits shape: [B, vocab_size]
+                vocab_logits = jnp.dot(prefix_hidden[:, -1, :], embedding_table.value.T)
+
+                # Sample next token (greedy for now - could use temperature/top-k)
+                next_token = jnp.argmax(vocab_logits, axis=-1)  # [B]
+                generated_tokens.append(int(next_token[0]))
+
+                # Check if EOS token generated
+                EOS_SKILL_TOKEN_ID = 257153
+                if int(next_token[0]) == EOS_SKILL_TOKEN_ID:
+                    break
+
+                # Embed next token and continue
+                next_token_2d = next_token[:, None]  # [B, 1]
+                # Manual embedding lookup: next_embedding = embedding_table[next_token_2d]
+                next_embedding = embedding_table.value[next_token_2d]  # [B, 1, hidden_dim]
+
+                # Create attention mask following the sample_actions pattern
+                # The new token can attend to all previous tokens in KV cache
+                next_mask = jnp.ones((batch_size, 1), dtype=jnp.bool_)  # [B, 1]
+                next_ar_mask = jnp.array([True], dtype=jnp.bool_)  # [1] - causal for new token
+                next_attn_mask = make_attn_mask(next_mask, next_ar_mask)  # [B, 1, 1]
+
+                # Expand the KV cache mask to cover all cached tokens
+                # KV cache now has: prefix + all previously generated tokens
+                kv_cache_mask = einops.repeat(prefix_mask, "b p -> b 1 p")  # [B, 1, prefix_len]
+
+                # For previously generated tokens, create mask
+                if step_idx > 0:
+                    # We have generated step_idx tokens already in cache
+                    past_generated_mask = jnp.ones((batch_size, 1, step_idx), dtype=jnp.bool_)
+                    kv_cache_mask = jnp.concatenate([kv_cache_mask, past_generated_mask], axis=-1)
+
+                # Full mask: [kv_cache_mask, next_attn_mask]
+                full_mask = jnp.concatenate([kv_cache_mask, next_attn_mask], axis=-1)
+                # Shape: [B, 1, current_cache_len + step_idx + 1]
+
+                # Position for the new token
+                next_position = jnp.array([[int(current_cache_len) + step_idx]], dtype=jnp.int32)  # [B, 1]
+
+                # Forward pass to get next hidden state
+                # Use PaliGemma expert (index 0) for skill generation
+                (next_hidden, _), kv_cache_skill = self.PaliGemma.llm(
+                    [next_embedding, None],
+                    mask=full_mask,
+                    positions=next_position,
+                    kv_cache=kv_cache_skill
+                )
+
+                # Update prefix_hidden for next iteration
+                prefix_hidden = jnp.concatenate([prefix_hidden, next_hidden], axis=1)
+            
+            # Decode generated tokens to text
+            if generated_tokens:
+                if tokenizer is not None:
+                    skill_text = tokenizer.decode(generated_tokens)
+                else:
+                    # Fallback: create minimal representation with token IDs
+                    skill_text = f"{{\"tokens\": {generated_tokens}}}"
+                    # Check if last token was EOS
+                    if generated_tokens[-1] == 257153:
+                        skill_text += "<EOS_SKILL>"
+            else:
+                skill_text = None
 
         return actions, skill_text
 

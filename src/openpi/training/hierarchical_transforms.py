@@ -120,13 +120,15 @@ class AddSkillAnnotation:
         task_idx = data.get("task_index")
 
         # If episode_index is missing, we can't proceed
+        # This is expected during inference (policy serving), so log at debug level
         if episode_idx is None or frame_idx is None:
-            logger.warning(
-                f"Missing episode_index or index in data. Skipping skill annotation.")
+            logger.debug(
+                "Missing episode_index or index in data. Skipping skill annotation (expected during inference).")
             data["has_skill"] = False
             data["skill_text"] = ""
             data["skill_dict"] = {}
             data["skill_idx"] = -1
+            data["predict_skill"] = False
             return data
 
         # Helper function to extract scalar value from various types (numpy, torch, scalar)

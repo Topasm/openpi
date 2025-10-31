@@ -7,9 +7,10 @@ import tyro
 
 from omnigibson.learning.utils.network_utils import WebsocketPolicyServer
 
+from openpi.shared.eval_b1k_hierarchical_wrapper import HierarchicalB1KPolicyWrapper
+
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
-from openpi.shared.eval_b1k_wrapper import B1KPolicyWrapper
 from openpi.training import config as _config
 
 import os
@@ -114,7 +115,15 @@ def main(args: Args) -> None:
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
 
-    policy = B1KPolicyWrapper(policy)
+    # Use hierarchical wrapper for full inference pipeline
+    policy = HierarchicalB1KPolicyWrapper(
+        policy=policy,
+        text_prompt=args.default_prompt or "Complete the household task",
+        control_mode="temporal_ensemble",
+        action_horizon=50,
+        log_dir="./eval_logs",
+        max_memory_skills=15,
+    )
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
