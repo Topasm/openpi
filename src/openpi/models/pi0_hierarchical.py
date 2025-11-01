@@ -734,6 +734,270 @@ class Pi0Hierarchical(_model.BaseModel):
 
         return actions, skill_text
 
+    def generate_skill_autoregressive(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        memory_tokens: Optional[jnp.ndarray] = None,
+        memory_mask: Optional[jnp.ndarray] = None,
+        tokenizer = None,
+        max_length: int = 64,
+        temperature: float = 0.0
+    ) -> tuple[str, jnp.ndarray, bool]:
+        """
+        Slow-Loop: Autoregressive skill generation with proper KV cache handling.
+
+        This function generates skill JSON text and returns the final hidden state
+        for use by the Fast-Loop as a "plan embedding".
+
+        Args:
+            rng: Random key (unused if temperature=0)
+            observation: Current observation (vision + task prompt)
+            memory_tokens: Past skills memory [B, memory_len] (optional)
+            memory_mask: Mask for memory [B, memory_len] (optional)
+            tokenizer: HierarchicalTokenizer for decoding
+            max_length: Maximum tokens to generate (default: 64)
+            temperature: Sampling temperature (0 = greedy)
+
+        Returns:
+            skill_json_text: Generated skill JSON string
+            skill_final_hidden: Last hidden state [B, hidden_dim] for Fast-Loop conditioning
+            has_eos: Whether <EOS_SKILL> token was generated
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        batch_size = observation.state.shape[0]
+
+        # 1. Embed prefix with optional memory
+        if memory_tokens is not None and memory_mask is not None:
+            prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix_with_memory(
+                observation, memory_tokens, memory_mask
+            )
+        else:
+            prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+
+        # 2. Fill KV cache with prefix
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_hidden, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=prefix_attn_mask,
+            positions=prefix_positions,
+            adarms_cond=[None, None]
+        )
+
+        # 3. Get embedding table for token generation
+        embedding_table = self.PaliGemma.llm.embedder['input_embedding']
+
+        # 4. Autoregressive generation loop (FIXED)
+        generated_tokens = []
+        current_hidden = prefix_hidden  # [B, prefix_len, hidden_dim]
+        has_eos = False
+        num_prefix_tokens = int(jnp.sum(prefix_mask[0]))  # Scalar
+
+        for step_idx in range(max_length):
+            # Project last hidden state to vocabulary
+            last_hidden = current_hidden[:, -1, :]  # [B, hidden_dim]
+            logits = jnp.dot(last_hidden, embedding_table.value.T)  # [B, vocab_size]
+
+            # Sample next token
+            if temperature == 0.0:
+                next_token = jnp.argmax(logits, axis=-1)  # [B]
+            else:
+                next_token = jax.random.categorical(rng, logits / temperature, axis=-1)
+
+            token_id = int(next_token[0])
+            generated_tokens.append(token_id)
+
+            # Check for EOS token
+            if self.use_hierarchical_tokenizer and tokenizer is not None and hasattr(tokenizer, 'eos_skill_token_id'):
+                eos_id = tokenizer.eos_skill_token_id
+            else:
+                eos_id = 257153  # Hardcoded fallback
+
+            if token_id == eos_id:
+                has_eos = True
+                logger.debug(f"[AR Generation] EOS token detected at step {step_idx}")
+                break
+
+            # 5. Embed next token and continue generation
+            next_token_expanded = next_token[:, None]  # [B, 1]
+            next_embedding = embedding_table.value[next_token_expanded]  # [B, 1, hidden_dim]
+
+            # **CRITICAL FIX**: Proper KV cache mask construction
+            # The KV cache now contains: prefix_tokens + all previously generated tokens
+            # Total cached tokens: num_prefix_tokens + step_idx
+            cache_len = num_prefix_tokens + step_idx
+
+            # New token position (absolute position in sequence)
+            new_position = jnp.array([[cache_len]], dtype=jnp.int32)  # [B, 1]
+
+            # Attention mask: new token can attend to ALL cached tokens + itself
+            # Shape: [B, query_len=1, key_len=cache_len+1]
+            # All True because causal masking is handled internally by make_attn_mask
+            new_token_mask = jnp.ones((batch_size, 1), dtype=jnp.bool_)  # [B, 1]
+            new_ar_mask = jnp.array([True], dtype=jnp.bool_)  # Causal for new token
+            new_attn_mask = make_attn_mask(new_token_mask, new_ar_mask)  # [B, 1, 1]
+
+            # Expand to include KV cache dimension
+            # The new token can see all cache_len previous tokens
+            cache_mask = jnp.ones((batch_size, 1, cache_len), dtype=jnp.bool_)
+            full_mask = jnp.concatenate([cache_mask, new_attn_mask], axis=-1)
+            # Final shape: [B, 1, cache_len + 1]
+
+            # Forward pass with KV cache
+            (next_hidden, _), kv_cache = self.PaliGemma.llm(
+                [next_embedding, None],
+                mask=full_mask,
+                positions=new_position,
+                kv_cache=kv_cache,
+                adarms_cond=[None, None]
+            )
+
+            # Append to hidden states (for final embedding extraction)
+            current_hidden = jnp.concatenate([current_hidden, next_hidden], axis=1)
+
+        # 6. Decode tokens to text
+        if tokenizer is not None:
+            skill_json_text = tokenizer.decode(generated_tokens)
+        else:
+            # Fallback: return token IDs as string
+            skill_json_text = f"{{\"tokens\": {generated_tokens}}}"
+            logger.warning("No tokenizer provided, returning token IDs")
+
+        # 7. Extract final hidden state for Fast-Loop
+        skill_final_hidden = current_hidden[:, -1, :]  # [B, hidden_dim]
+
+        logger.info(f"[Slow-Loop] Generated: {skill_json_text[:100]}... (has_eos={has_eos})")
+
+        return skill_json_text, skill_final_hidden, has_eos
+
+    def execute_fast_loop(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        current_plan_embedding: jnp.ndarray,
+        num_ode_steps: int = 10
+    ) -> tuple[_model.Actions, float, jnp.ndarray]:
+        """
+        Fast-Loop: Action generation + EOS detection in one forward pass.
+
+        This method runs on every frame and must be fast. It:
+        1. Generates actions via ODE flow matching
+        2. Predicts EOS probability using the Skill Head in classifier mode
+        3. (Optional) Detects plan deviation by comparing predicted skill to plan
+
+        Args:
+            rng: Random key
+            observation: Current observation (vision + task prompt)
+            current_plan_embedding: Plan embedding from Slow-Loop [B, hidden_dim]
+            num_ode_steps: ODE integration steps (default: 10)
+
+        Returns:
+            actions: Predicted actions [B, action_horizon, action_dim]
+            eos_probability: Probability that skill is complete (0-1)
+            predicted_skill_logits: Logits over vocabulary [B, vocab_size] for plan deviation
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        batch_size = observation.state.shape[0]
+
+        # ===== 1. Embed Prefix with Plan Conditioning =====
+        # Embed current observation (vision + prompt)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+
+        # Inject plan embedding as first token (acts as "goal" conditioning)
+        plan_emb_expanded = current_plan_embedding[:, None, :]  # [B, 1, hidden_dim]
+        prefix_tokens_conditioned = jnp.concatenate([plan_emb_expanded, prefix_tokens], axis=1)
+
+        # Update masks
+        plan_mask = jnp.ones((batch_size, 1), dtype=jnp.bool_)
+        prefix_mask_conditioned = jnp.concatenate([plan_mask, prefix_mask], axis=1)
+        prefix_ar_mask_conditioned = jnp.concatenate([
+            jnp.array([False]),  # Plan token has full attention
+            prefix_ar_mask
+        ], axis=0)
+
+        # ===== 2. Fill KV Cache (One Forward Pass) =====
+        prefix_attn_mask = make_attn_mask(prefix_mask_conditioned, prefix_ar_mask_conditioned)
+        prefix_positions = jnp.cumsum(prefix_mask_conditioned, axis=1) - 1
+        (prefix_hidden, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens_conditioned, None],
+            mask=prefix_attn_mask,
+            positions=prefix_positions,
+            adarms_cond=[None, None]
+        )
+
+        # ===== 3. EOS Detection (Classifier Mode) =====
+        # Use the last hidden state to predict skill tokens
+        # This is NON-AUTOREGRESSIVE (single pass, no loop)
+        last_hidden = prefix_hidden[:, -1:, :]  # [B, 1, hidden_dim]
+
+        # Project to vocabulary using embedding table
+        embedding_table = self.PaliGemma.llm.embedder['input_embedding']
+        skill_logits = jnp.dot(last_hidden[:, 0, :], embedding_table.value.T)  # [B, vocab_size]
+
+        # Extract EOS token probability
+        if self.use_hierarchical_tokenizer:
+            # Get EOS token ID from tokenizer (stored during init)
+            # For now, use hardcoded value (could be passed as config)
+            eos_token_id = 257153
+        else:
+            eos_token_id = 257153
+
+        eos_logit = skill_logits[:, eos_token_id]  # [B]
+        eos_probability = float(jax.nn.sigmoid(eos_logit[0]))  # Convert to [0, 1]
+
+        logger.debug(f"[Fast-Loop] EOS probability: {eos_probability:.4f}")
+
+        # ===== 4. Action Generation (ODE Flow Matching) =====
+        # Standard Pi0 flow matching, but using plan-conditioned KV cache
+        dt = -1.0 / num_ode_steps
+        noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        def ode_step(carry):
+            x_t, time = carry
+
+            # Embed noisy actions
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix_action(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+
+            # Attention mask for action suffix
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+
+            # Expand prefix mask to cover action tokens
+            prefix_attn_expanded = einops.repeat(
+                prefix_mask_conditioned, "b p -> b s p", s=suffix_tokens.shape[1]
+            )
+            full_attn_mask = jnp.concatenate([prefix_attn_expanded, suffix_attn_mask], axis=-1)
+
+            # Positions for action tokens
+            positions_suffix = (
+                jnp.sum(prefix_mask_conditioned, axis=-1)[:, None] +
+                jnp.cumsum(suffix_mask, axis=-1) - 1
+            )
+
+            # Forward pass (only action expert, reuse KV cache from prefix)
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],  # Only action expert input
+                mask=full_attn_mask,
+                positions=positions_suffix,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond if self.pi05 else None],
+            )
+
+            # Predict velocity
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            x_t, time = carry
+            return time >= -dt / 2
+
+        actions, _ = jax.lax.while_loop(cond, ode_step, (noise, 1.0))
+
+        return actions, eos_probability, skill_logits
+
 
 # Factory function to create hierarchical config from standard Pi0 config
 def hierarchical_config_from_pi0(
