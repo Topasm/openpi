@@ -77,6 +77,12 @@ class Pi0HierarchicalConfig(pi0_config.Pi0Config):
         max_skill_tokens: Maximum number of tokens for skill text (default: 64)
         use_hierarchical_tokenizer: Whether to use HierarchicalTokenizer with special tokens (Phase 3)
         vocab_size_override: Override vocabulary size (use when adding special tokens like <EOS_SKILL>)
+
+        Scheduled Sampling (for AR generation training):
+        use_scheduled_sampling: Enable scheduled sampling during training (default: False)
+        initial_teacher_forcing: Initial teacher forcing ratio (default: 1.0)
+        final_teacher_forcing: Final teacher forcing ratio (default: 0.3)
+        tf_decay_steps: Steps over which to decay teacher forcing (default: 50000)
     """
 
     skill_loss_weight: float = 10.0
@@ -84,6 +90,12 @@ class Pi0HierarchicalConfig(pi0_config.Pi0Config):
     max_skill_tokens: int = 64  # Maximum length of skill text
     use_hierarchical_tokenizer: bool = False  # Phase 3: Enable HierarchicalTokenizer
     vocab_size_override: Optional[int] = None  # Override vocab size for special tokens
+
+    # Scheduled Sampling Config
+    use_scheduled_sampling: bool = False
+    initial_teacher_forcing: float = 1.0
+    final_teacher_forcing: float = 0.3
+    tf_decay_steps: int = 50000
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0Hierarchical":
@@ -111,6 +123,12 @@ class Pi0Hierarchical(_model.BaseModel):
         self.action_loss_weight = config.action_loss_weight
         self.max_skill_tokens = config.max_skill_tokens
         self.use_hierarchical_tokenizer = config.use_hierarchical_tokenizer
+
+        # Scheduled Sampling Config
+        self.use_scheduled_sampling = config.use_scheduled_sampling
+        self.initial_teacher_forcing = config.initial_teacher_forcing
+        self.final_teacher_forcing = config.final_teacher_forcing
+        self.tf_decay_steps = config.tf_decay_steps
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -319,6 +337,27 @@ class Pi0Hierarchical(_model.BaseModel):
 
         return action_expert_tokens, suffix_mask, suffix_ar_mask, adarms_cond
 
+    def compute_tf_ratio(self, step: int) -> float:
+        """
+        Compute teacher forcing ratio with linear decay for scheduled sampling.
+
+        Args:
+            step: Current training step
+
+        Returns:
+            Teacher forcing ratio (from initial_teacher_forcing to final_teacher_forcing)
+        """
+        if not self.use_scheduled_sampling:
+            return 1.0  # Always use teacher forcing if scheduled sampling disabled
+
+        # Linear decay
+        progress = jnp.minimum(float(step) / float(self.tf_decay_steps), 1.0)
+        tf_ratio = self.initial_teacher_forcing - progress * (
+            self.initial_teacher_forcing - self.final_teacher_forcing
+        )
+
+        return float(tf_ratio)
+
     @override
     def compute_loss(
         self,
@@ -330,7 +369,8 @@ class Pi0Hierarchical(_model.BaseModel):
         memory_tokens: Optional[at.Int[at.Array, "b memory_len"]] = None,
         memory_mask: Optional[at.Bool[at.Array, "b memory_len"]] = None,
         *,
-        train: bool = False
+        train: bool = False,
+        train_step: int = 0
     ) -> tuple[at.Float[at.Array, ""], dict]:
         """
         Compute hierarchical multi-task loss with optional memory (Phases 0/1/3).
@@ -401,61 +441,138 @@ class Pi0Hierarchical(_model.BaseModel):
             "action_loss": action_loss,
         }
 
-        # ===== Skill Loss (Language Modeling) =====
+        # ===== Skill Loss with Scheduled Sampling =====
         if skill_tokens is not None and skill_mask is not None:
-            # Forward pass: prefix only (for skill prediction)
-            # We need to get the hidden states from PaliGemma expert (index 0)
-            # and project them to vocabulary space for next-token prediction
-
-            prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-            prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
-
-            # Run only prefix through PaliGemma expert
-            # LLM returns a list with two elements [paligemma_output, action_expert_output]
-            # Since we pass [prefix_tokens, None], action_expert_output will be None
-            (prefix_hidden, _), _ = self.PaliGemma.llm(
-                [prefix_tokens, None],
-                mask=prefix_attn_mask,
-                positions=prefix_positions,
-                adarms_cond=[None, None]
-            )
-
-            # Project hidden states to vocabulary using Gemma's embedder.decode()
-            # This converts [B, seq_len, hidden_dim] -> [B, seq_len, vocab_size]
-            # The embedder is wrapped in ToNNX, so we manually perform the decode operation
-            # decode(x) = dot(x, embedding_table.T)
-            embedding_table = self.PaliGemma.llm.embedder['input_embedding']
-            vocab_logits = jnp.dot(prefix_hidden, embedding_table.value.T)
-            # Shape: [B, prefix_len, vocab_size=257152]
-
-            # Extract logits for skill tokens
-            # The skill tokens should be at the end of the prefix
-            # We predict skill_tokens[1:] from skill_tokens[:-1] (teacher forcing)
+            batch_size = observation.state.shape[0]
             skill_len = skill_tokens.shape[1]
 
-            # Get logits for skill prediction positions
-            skill_logits = vocab_logits[:, -skill_len:, :]  # [B, skill_len, vocab_size]
+            # Compute teacher forcing ratio (decays over training)
+            tf_ratio = self.compute_tf_ratio(train_step)
 
-            # Shift for next-token prediction
-            targets = skill_tokens[:, 1:]  # [B, skill_len-1]
-            logits = skill_logits[:, :-1, :]  # [B, skill_len-1, vocab_size]
-            mask = skill_mask[:, 1:]  # [B, skill_len-1]
+            if self.use_scheduled_sampling and train and skill_len > 1:
+                # ===== Scheduled Sampling Mode =====
+                # Autoregressive loop with mixed teacher forcing and model predictions
 
-            # Compute cross-entropy loss
-            import optax
-            token_losses = optax.softmax_cross_entropy_with_integer_labels(
-                logits=logits,
-                labels=targets
-            )  # [B, skill_len-1]
+                # 1. Initial forward pass (vision + prompt, NO skill tokens yet)
+                prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+                prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
 
-            # Masked average
-            masked_loss = token_losses * mask
-            skill_loss = jnp.sum(masked_loss) / jnp.maximum(jnp.sum(mask), 1.0)
+                (current_hidden, _), kv_cache = self.PaliGemma.llm(
+                    [prefix_tokens, None],
+                    mask=prefix_attn_mask,
+                    positions=prefix_positions,
+                    adarms_cond=[None, None]
+                )
 
-            loss_dict["skill_loss"] = skill_loss
+                # 2. Autoregressive loop with scheduled sampling
+                embedding_table = self.PaliGemma.llm.embedder['input_embedding']
+                all_logits = []
+                ss_rng = rng  # Use rng for scheduled sampling
+
+                for t in range(skill_len - 1):
+                    # Project current hidden state to vocabulary
+                    last_hidden = current_hidden[:, -1, :]  # [B, hidden_dim]
+                    logits = jnp.dot(last_hidden, embedding_table.value.T)  # [B, vocab_size]
+                    all_logits.append(logits)
+
+                    # Scheduled sampling: choose input for next step
+                    use_teacher_forcing = jax.random.bernoulli(
+                        ss_rng, tf_ratio, shape=(batch_size,)
+                    )
+
+                    # Get next token
+                    predicted_token = jnp.argmax(logits, axis=-1)  # [B]
+                    next_token = jnp.where(
+                        use_teacher_forcing,
+                        skill_tokens[:, t],    # Use ground truth
+                        predicted_token         # Use prediction
+                    )
+
+                    # Embed and continue (if not last step)
+                    if t < skill_len - 2:
+                        next_token_expanded = next_token[:, None]
+                        next_embedding = self.PaliGemma.llm(next_token_expanded, method="embed")
+
+                        # Update KV cache (use fixed logic from generate_skill_autoregressive)
+                        actual_cache_len = kv_cache[0][0].shape[1]
+                        new_position = jnp.array([[actual_cache_len]], dtype=jnp.int32)
+
+                        # Create mask
+                        cache_mask = jnp.ones((batch_size, 1, actual_cache_len), dtype=jnp.bool_)
+                        new_token_mask = jnp.ones((batch_size, 1, 1), dtype=jnp.bool_)
+                        full_mask = jnp.concatenate([cache_mask, new_token_mask], axis=-1)
+
+                        # Forward pass
+                        (next_hidden, _), kv_cache = self.PaliGemma.llm(
+                            [next_embedding, None],
+                            mask=full_mask,
+                            positions=new_position,
+                            kv_cache=kv_cache,
+                            adarms_cond=[None, None]
+                        )
+
+                        # Concatenate hidden states
+                        current_hidden = jnp.concatenate([current_hidden, next_hidden], axis=1)
+
+                    ss_rng, _ = jax.random.split(ss_rng)
+
+                # 3. Compute loss
+                stacked_logits = jnp.stack(all_logits, axis=1)  # [B, skill_len-1, vocab_size]
+                targets = skill_tokens[:, 1:]
+                mask = skill_mask[:, 1:]
+
+                import optax
+                token_losses = optax.softmax_cross_entropy_with_integer_labels(
+                    logits=stacked_logits,
+                    labels=targets
+                )
+
+                masked_loss = token_losses * mask
+                skill_loss = jnp.sum(masked_loss) / jnp.maximum(jnp.sum(mask), 1.0)
+
+                loss_dict["skill_loss"] = skill_loss
+                loss_dict["teacher_forcing_ratio"] = tf_ratio
+
+            else:
+                # ===== Standard Teacher Forcing Mode =====
+                # (Used when scheduled sampling disabled or during eval)
+                prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+                prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+
+                (prefix_hidden, _), _ = self.PaliGemma.llm(
+                    [prefix_tokens, None],
+                    mask=prefix_attn_mask,
+                    positions=prefix_positions,
+                    adarms_cond=[None, None]
+                )
+
+                embedding_table = self.PaliGemma.llm.embedder['input_embedding']
+                vocab_logits = jnp.dot(prefix_hidden, embedding_table.value.T)
+
+                # Extract logits for skill tokens
+                skill_logits = vocab_logits[:, -skill_len:, :]
+
+                # Shift for next-token prediction
+                targets = skill_tokens[:, 1:]
+                logits = skill_logits[:, :-1, :]
+                mask = skill_mask[:, 1:]
+
+                import optax
+                token_losses = optax.softmax_cross_entropy_with_integer_labels(
+                    logits=logits,
+                    labels=targets
+                )
+
+                masked_loss = token_losses * mask
+                skill_loss = jnp.sum(masked_loss) / jnp.maximum(jnp.sum(mask), 1.0)
+
+                loss_dict["skill_loss"] = skill_loss
+                loss_dict["teacher_forcing_ratio"] = 1.0
+
         else:
             skill_loss = jnp.array(0.0)
             loss_dict["skill_loss"] = skill_loss
+            loss_dict["teacher_forcing_ratio"] = 1.0
 
         # ===== Total Loss =====
         total_loss = (
@@ -808,6 +925,11 @@ class Pi0Hierarchical(_model.BaseModel):
             token_id = int(next_token[0])
             generated_tokens.append(token_id)
 
+            # Debug: Log ALL generated tokens to diagnose "cococo" issue
+            top_5_tokens = jnp.argsort(logits[0])[-5:][::-1]
+            top_5_logits = logits[0][top_5_tokens]
+            logger.info(f"[AR Step {step_idx}] token_id={token_id}, top-5: {list(zip(top_5_tokens.tolist(), top_5_logits.tolist()))}")
+
             # Check for EOS token
             if self.use_hierarchical_tokenizer and tokenizer is not None and hasattr(tokenizer, 'eos_skill_token_id'):
                 eos_id = tokenizer.eos_skill_token_id
@@ -821,28 +943,36 @@ class Pi0Hierarchical(_model.BaseModel):
 
             # 5. Embed next token and continue generation
             next_token_expanded = next_token[:, None]  # [B, 1]
-            next_embedding = embedding_table.value[next_token_expanded]  # [B, 1, hidden_dim]
+            # CRITICAL: Use llm's embed method which applies sqrt(embed_dim) scaling!
+            # Direct embedding lookup: embedding_table.value[tokens] is WRONG (missing scaling)
+            next_embedding = self.PaliGemma.llm(next_token_expanded, method="embed")  # [B, 1, hidden_dim]
 
             # **CRITICAL FIX**: Proper KV cache mask construction
             # The KV cache now contains: prefix_tokens + all previously generated tokens
-            # Total cached tokens: num_prefix_tokens + step_idx
-            cache_len = num_prefix_tokens + step_idx
+            # We need to query the ACTUAL cache size from the KV cache itself
+
+            # Get actual cache size from KV cache
+            # kv_cache is a tuple of (cache_k, cache_v) per layer
+            # Shape of cache_k: [B, actual_cache_len, num_kv_heads, head_dim]
+            actual_cache_len = kv_cache[0][0].shape[1]  # First layer, cache_k, sequence length
+
+            logger.debug(f"[AR Gen Step {step_idx}] Calculated cache_len={num_prefix_tokens + step_idx}, Actual KV cache size={actual_cache_len}")
 
             # New token position (absolute position in sequence)
-            new_position = jnp.array([[cache_len]], dtype=jnp.int32)  # [B, 1]
+            new_position = jnp.array([[actual_cache_len]], dtype=jnp.int32)  # [B, 1]
 
             # Attention mask: new token can attend to ALL cached tokens + itself
-            # Shape: [B, query_len=1, key_len=cache_len+1]
-            # All True because causal masking is handled internally by make_attn_mask
+            # Following the pattern from sample_actions (lines 514-515)
+            # For KV cache, we need [B, query_len, total_len] mask
             new_token_mask = jnp.ones((batch_size, 1), dtype=jnp.bool_)  # [B, 1]
-            new_ar_mask = jnp.array([True], dtype=jnp.bool_)  # Causal for new token
+            new_ar_mask = jnp.array([True], dtype=jnp.bool_)  # [1] Causal for new token
             new_attn_mask = make_attn_mask(new_token_mask, new_ar_mask)  # [B, 1, 1]
 
-            # Expand to include KV cache dimension
-            # The new token can see all cache_len previous tokens
-            cache_mask = jnp.ones((batch_size, 1, cache_len), dtype=jnp.bool_)
+            # Expand prefix mask to cover KV cache
+            # The new token can see all actual_cache_len previous tokens (from KV cache)
+            cache_mask = einops.repeat(jnp.ones(actual_cache_len, dtype=jnp.bool_), "p -> b s p", b=batch_size, s=1)
             full_mask = jnp.concatenate([cache_mask, new_attn_mask], axis=-1)
-            # Final shape: [B, 1, cache_len + 1]
+            # Final shape: [B, 1, actual_cache_len + 1]
 
             # Forward pass with KV cache
             (next_hidden, _), kv_cache = self.PaliGemma.llm(

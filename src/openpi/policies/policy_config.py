@@ -92,7 +92,7 @@ def create_trained_policy(
 
     # Create tokenizer for hierarchical models
     tokenizer = None
-    if hasattr(model, "infer_with_memory"):
+    if hasattr(model, "generate_skill_autoregressive") or hasattr(model, "infer_with_memory"):
         # This is a hierarchical model - create HierarchicalTokenizer
         try:
             tokenizer = _tokenizer.HierarchicalTokenizer(

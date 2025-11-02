@@ -61,7 +61,9 @@ class Policy(BasePolicy):
         self._tokenizer = tokenizer
 
         # Check if model supports hierarchical skill generation
-        self._supports_skill_generation = hasattr(model, "infer_with_memory")
+        # Prefer new generate_skill_autoregressive over old infer_with_memory
+        self._supports_skill_generation = hasattr(model, "generate_skill_autoregressive") or hasattr(model, "infer_with_memory")
+        self._use_new_api = hasattr(model, "generate_skill_autoregressive")
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -72,10 +74,14 @@ class Policy(BasePolicy):
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
             
-            # Don't JIT infer_with_memory - it contains autoregressive generation loops
-            # that are not compatible with JAX tracing
+            # Don't JIT autoregressive generation - contains loops not compatible with JAX tracing
             if self._supports_skill_generation:
-                self._infer_with_memory = model.infer_with_memory
+                if self._use_new_api:
+                    # Use new fixed API
+                    self._generate_skill = model.generate_skill_autoregressive
+                else:
+                    # Fallback to old API (has KV cache bugs)
+                    self._infer_with_memory = model.infer_with_memory
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None, memory_text: str | None = None) -> dict:  # type: ignore[misc]
@@ -117,20 +123,45 @@ class Policy(BasePolicy):
             # Use hierarchical inference path (generate skills + actions)
             # Provide empty string if no memory_text given
             memory_input = memory_text if memory_text is not None else ""
-            
+
             if not self._is_pytorch_model:
                 try:
-                    skill_generation_rng, self._rng = jax.random.split(self._rng)
-                    actions, skill_json = self._infer_with_memory(
-                        skill_generation_rng,
-                        observation,
-                        memory_text=memory_input,
-                        tokenizer=self._tokenizer,
-                        generate_skill=True,
-                    )
-                    # Check if skill ends with EOS
-                    has_eos = skill_json is not None and "<EOS_SKILL>" in skill_json
-                    # Use actions from infer_with_memory instead of sample_actions
+                    skill_generation_rng, action_rng, self._rng = jax.random.split(self._rng, 3)
+
+                    if self._use_new_api:
+                        # Use new fixed API (separate skill generation + action sampling)
+                        # Tokenize memory if provided
+                        memory_tokens, memory_mask = None, None
+                        if memory_input:
+                            mem_tok, mem_mask = self._tokenizer.tokenize(memory_input)
+                            memory_tokens = jnp.array(mem_tok)[None, :]
+                            memory_mask = jnp.array(mem_mask)[None, :]
+
+                        # Generate skill using fixed method
+                        skill_json, plan_embedding, has_eos = self._generate_skill(
+                            skill_generation_rng,
+                            observation,
+                            memory_tokens=memory_tokens,
+                            memory_mask=memory_mask,
+                            tokenizer=self._tokenizer,
+                            max_length=64,
+                            temperature=0.0
+                        )
+
+                        # Generate actions separately
+                        actions = self._sample_actions(action_rng, observation, **sample_kwargs)
+                    else:
+                        # Fallback to old API (has KV cache bugs)
+                        actions, skill_json = self._infer_with_memory(
+                            skill_generation_rng,
+                            observation,
+                            memory_text=memory_input,
+                            tokenizer=self._tokenizer,
+                            generate_skill=True,
+                        )
+                        has_eos = skill_json is not None and "<EOS_SKILL>" in skill_json
+
+                    # Use generated actions and skills
                     outputs = {
                         "state": inputs["state"],
                         "actions": actions,

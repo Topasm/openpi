@@ -1027,6 +1027,11 @@ _CONFIGS = [
             skill_loss_weight=10.0,
             action_loss_weight=1.0,
             max_skill_tokens=64,
+            # Scheduled Sampling (disabled by default, enable for retraining)
+            use_scheduled_sampling=False,
+            initial_teacher_forcing=1.0,
+            final_teacher_forcing=0.3,
+            tf_decay_steps=50000,
         ),
         data=LeRobotB1KHierarchicalDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
